@@ -52,13 +52,14 @@ public class ConsoleWorker
     public async Task RunAsync(CancellationToken ct)
     {
         // Ensure the worker's visible console uses UTF-8 for both input and output.
-        // This is required for correct display of CJK and other non-ASCII characters
-        // in all Windows language environments.
         Console.InputEncoding = Encoding.UTF8;
         Console.OutputEncoding = Encoding.UTF8;
 
+        // Prepare shell integration script BEFORE launching the shell.
+        // For pwsh, we pass it via -NoExit -Command so it doesn't echo in the console.
+        var commandLine = BuildCommandLine();
+
         // Launch shell via platform PTY (ConPTY on Windows, forkpty on Linux/macOS)
-        var commandLine = $"\"{_shell}\"";
         _pty = PtyFactory.Start(commandLine, _cwd);
         _writer = _pty.InputStream;
 
@@ -66,26 +67,27 @@ public class ConsoleWorker
         var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var readTask = ReadOutputLoop(readCts.Token);
 
-        // Wait for shell to fully start (profile loading may take several seconds).
-        // Monitor output length and wait until it settles.
+        // Wait for shell to fully start (profile + injection via -Command).
         await WaitForOutputSettled(ct);
 
-        await InjectShellIntegration(ct);
-
-        // After injection, send an empty newline to trigger the next prompt.
-        // ConPTY needs input to flush new output to the pipe.
-        await Task.Delay(500, ct);
-        // Use \r only (not \r\n) — pwsh interprets \n as LF which opens
-        // a multi-line continuation (>> prompt). \r alone = Enter.
-        await WriteToPty("\r", ct);
+        // For shells that don't support -Command injection (bash/zsh),
+        // inject via PTY input after startup.
+        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
+        if (shellName is not "pwsh" and not "powershell")
+        {
+            await InjectShellIntegration(ct);
+            await Task.Delay(500, ct);
+            await WriteToPty("\r", ct);
+        }
+        else
+        {
+            // pwsh: injection was done via -Command, just kick a \r to trigger prompt
+            await WriteToPty("\r", ct);
+        }
 
         // Wait for PromptStart marker from shell integration (confirms OSC pipeline is working)
         await WaitForReady(TimeSpan.FromSeconds(15), ct);
         _ready = true;
-
-        // Clear the visible console — removes the injection command echo and startup banner
-        await WriteToPty("Clear-Host\r", ct);
-        await Task.Delay(300, ct);
 
         Log($"Shell ready, pipe={_pipeName}");
 
@@ -137,6 +139,32 @@ public class ConsoleWorker
     }
 
     // --- Shell integration injection ---
+
+    /// <summary>
+    /// Build the command line for launching the shell.
+    /// For pwsh: injects shell integration via -NoExit -Command (no echo in console).
+    /// For bash/zsh: plain shell, injection happens later via PTY input.
+    /// </summary>
+    private string BuildCommandLine()
+    {
+        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
+
+        if (shellName is "pwsh" or "powershell")
+        {
+            var script = LoadEmbeddedScript("integration.ps1");
+            if (script != null)
+            {
+                var tmpFile = Path.Combine(Path.GetTempPath(), $".shellpilot-integration-{Environment.ProcessId}.ps1");
+                File.WriteAllText(tmpFile, script);
+                // -NoExit keeps the shell alive after -Command completes.
+                // The command imports PSReadLine + sources the integration script silently.
+                var cmd = $"Import-Module PSReadLine -ErrorAction SilentlyContinue; . '{tmpFile}'; Remove-Item '{tmpFile}' -ErrorAction SilentlyContinue";
+                return $"\"{_shell}\" -NoExit -Command \"{cmd}\"";
+            }
+        }
+
+        return $"\"{_shell}\"";
+    }
 
     private async Task WaitForOutputSettled(CancellationToken ct)
     {
