@@ -513,6 +513,54 @@ public class ConsoleManager
         return null;
     }
 
+    // --- Cached output collection ---
+
+    /// <summary>
+    /// Collect cached outputs from all owned consoles (single scan, no polling).
+    /// Called from every MCP tool to drain completed background commands.
+    /// </summary>
+    public async Task<List<ExecuteResult>> CollectCachedOutputsAsync(string agentId)
+    {
+        var results = new List<ExecuteResult>();
+
+        foreach (var pipe in EnumeratePipes(ProxyPid, agentId))
+        {
+            var pid = GetPidFromPipeName(pipe);
+            if (!pid.HasValue) continue;
+
+            try
+            {
+                var statusResp = await SendPipeRequestAsync(pipe,
+                    new { type = "get_status" },
+                    TimeSpan.FromSeconds(3));
+
+                var hasCached = statusResp.TryGetProperty("hasCachedOutput", out var hc) && hc.GetBoolean();
+                if (!hasCached) continue;
+
+                var cachedResp = await SendPipeRequestAsync(pipe,
+                    new { type = "get_cached_output" },
+                    TimeSpan.FromSeconds(5));
+
+                var cacheStatus = cachedResp.TryGetProperty("status", out var cs) ? cs.GetString() : null;
+                if (cacheStatus != "ok") continue;
+
+                var displayName = _consoles.GetValueOrDefault(pid.Value)?.DisplayName ?? $"#{pid.Value}";
+                results.Add(new ExecuteResult
+                {
+                    Output = cachedResp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "",
+                    ExitCode = cachedResp.TryGetProperty("exitCode", out var e) ? e.GetInt32() : 0,
+                    Duration = cachedResp.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
+                    Command = cachedResp.TryGetProperty("command", out var c) ? c.GetString() : null,
+                    DisplayName = displayName,
+                    Cwd = cachedResp.TryGetProperty("cwd", out var w) ? w.GetString() : null,
+                });
+            }
+            catch { }
+        }
+
+        return results;
+    }
+
     // --- Wait for completion ---
 
     /// <summary>

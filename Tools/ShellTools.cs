@@ -1,5 +1,6 @@
 using ModelContextProtocol.Server;
 using System.ComponentModel;
+using System.Text;
 using ShellPilot.Services;
 
 namespace ShellPilot.Tools;
@@ -34,9 +35,11 @@ public class ShellTools
         }
 
         var result = await consoleManager.StartConsoleAsync(shell, cwd, reason, agentId, banner);
-        if (result.Status == "reused")
-            return $"Reusing standby console {result.DisplayName}. Did not launch a new console. To force a new console, provide the reason parameter.";
-        return $"Console {result.DisplayName} opened.";
+        var response = result.Status == "reused"
+            ? $"Reusing standby console {result.DisplayName}. Did not launch a new console. To force a new console, provide the reason parameter."
+            : $"Console {result.DisplayName} opened.";
+
+        return await AppendCachedOutputs(consoleManager, agentId, response);
     }
 
     [McpServerTool]
@@ -56,18 +59,21 @@ public class ShellTools
         var agentId = agent_id ?? "default";
         var result = await consoleManager.ExecuteCommandAsync(pipeline, timeout_seconds, agentId, shell);
 
+        string response;
         if (result.TimedOut)
-            return $"⧗ {result.DisplayName} | Status: Busy | Pipeline: {result.Command}\nUse wait_for_completion tool to wait and retrieve the result.";
+            response = $"⧗ {result.DisplayName} | Status: Busy | Pipeline: {result.Command}\nUse wait_for_completion tool to wait and retrieve the result.";
+        else if (result.Switched)
+            response = result.Output ?? "";
+        else
+        {
+            var cwdInfo = result.Cwd != null ? $" | Location: {result.Cwd}" : "";
+            var statusLine = result.ExitCode == 0
+                ? $"✓ {result.DisplayName} | Status: Completed | Pipeline: {result.Command} | Duration: {result.Duration}s{cwdInfo}"
+                : $"✗ {result.DisplayName} | Status: Failed (exit {result.ExitCode}) | Pipeline: {result.Command} | Duration: {result.Duration}s{cwdInfo}";
+            response = $"{statusLine}\n\n{(string.IsNullOrEmpty(result.Output) ? "(no output)" : result.Output)}";
+        }
 
-        if (result.Switched)
-            return result.Output ?? "";
-
-        var cwdInfo = result.Cwd != null ? $" | Location: {result.Cwd}" : "";
-        var statusLine = result.ExitCode == 0
-            ? $"✓ {result.DisplayName} | Status: Completed | Pipeline: {result.Command} | Duration: {result.Duration}s{cwdInfo}"
-            : $"✗ {result.DisplayName} | Status: Failed (exit {result.ExitCode}) | Pipeline: {result.Command} | Duration: {result.Duration}s{cwdInfo}";
-
-        return $"{statusLine}\n\n{(string.IsNullOrEmpty(result.Output) ? "(no output)" : result.Output)}";
+        return await AppendCachedOutputs(consoleManager, agentId, response);
     }
 
     [McpServerTool]
@@ -86,7 +92,7 @@ public class ShellTools
         if (results.Count == 0)
             return "No completed results. Consoles may still be busy — try again later.";
 
-        var sb = new System.Text.StringBuilder();
+        var sb = new StringBuilder();
         foreach (var r in results)
         {
             var cwdInfo = r.Cwd != null ? $" | Location: {r.Cwd}" : "";
@@ -99,5 +105,31 @@ public class ShellTools
             sb.AppendLine();
         }
         return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>
+    /// Collect cached outputs from all consoles and append to the response.
+    /// Called at the very end of each tool, just before returning, so no
+    /// cached results are missed due to processing delays.
+    /// </summary>
+    private static async Task<string> AppendCachedOutputs(ConsoleManager consoleManager, string agentId, string response)
+    {
+        var cached = await consoleManager.CollectCachedOutputsAsync(agentId);
+        if (cached.Count == 0) return response;
+
+        var sb = new StringBuilder();
+        foreach (var r in cached)
+        {
+            var cwdInfo = r.Cwd != null ? $" | Location: {r.Cwd}" : "";
+            var statusLine = r.ExitCode == 0
+                ? $"✓ {r.DisplayName} | Status: Completed | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}"
+                : $"✗ {r.DisplayName} | Status: Failed (exit {r.ExitCode}) | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}";
+            sb.AppendLine(statusLine);
+            sb.AppendLine();
+            sb.AppendLine(string.IsNullOrEmpty(r.Output) ? "(no output)" : r.Output);
+            sb.AppendLine();
+        }
+        sb.Append(response);
+        return sb.ToString();
     }
 }
