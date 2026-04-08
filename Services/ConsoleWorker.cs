@@ -82,6 +82,11 @@ public class ConsoleWorker
         // Wait for PromptStart marker from shell integration (confirms OSC pipeline is working)
         await WaitForReady(TimeSpan.FromSeconds(15), ct);
         _ready = true;
+
+        // Clear the visible console — removes the injection command echo and startup banner
+        await WriteToPty("Clear-Host\r", ct);
+        await Task.Delay(300, ct);
+
         Log($"Shell ready, pipe={_pipeName}");
 
         // Start forwarding user's keyboard input from visible console to ConPTY
