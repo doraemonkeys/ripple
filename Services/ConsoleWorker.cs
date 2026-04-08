@@ -51,6 +51,12 @@ public class ConsoleWorker
 
     public async Task RunAsync(CancellationToken ct)
     {
+        // Ensure the worker's visible console uses UTF-8 for both input and output.
+        // This is required for correct display of CJK and other non-ASCII characters
+        // in all Windows language environments.
+        Console.InputEncoding = Encoding.UTF8;
+        Console.OutputEncoding = Encoding.UTF8;
+
         // Launch shell via platform PTY (ConPTY on Windows, forkpty on Linux/macOS)
         var commandLine = $"\"{_shell}\"";
         _pty = PtyFactory.Start(commandLine, _cwd);
@@ -260,8 +266,8 @@ public class ConsoleWorker
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool ReadFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool ReadConsoleW(IntPtr hConsoleInput, char[] lpBuffer, uint nNumberOfCharsToRead, out uint lpNumberOfCharsRead, IntPtr pInputControl);
 
     private const int STD_INPUT_HANDLE = -10;
     // VT input: arrow keys become \x1b[A etc., no line buffering, no echo
@@ -290,10 +296,11 @@ public class ConsoleWorker
                 //   - No ENABLE_PROCESSED_INPUT: Ctrl+C → \x03 (not signal)
                 SetConsoleMode(hStdIn, ENABLE_VIRTUAL_TERMINAL_INPUT);
 
-                var buffer = new byte[256];
+                var charBuf = new char[256];
                 while (!ct.IsCancellationRequested)
                 {
-                    if (!ReadFile(hStdIn, buffer, (uint)buffer.Length, out var bytesRead, IntPtr.Zero) || bytesRead == 0)
+                    // ReadConsoleW reads Unicode (UTF-16) — handles CJK characters correctly
+                    if (!ReadConsoleW(hStdIn, charBuf, (uint)charBuf.Length, out var charsRead, IntPtr.Zero) || charsRead == 0)
                         break;
 
                     // Don't forward while AI is executing — avoid mixed input
@@ -301,7 +308,9 @@ public class ConsoleWorker
 
                     try
                     {
-                        _pty!.InputStream.Write(buffer, 0, (int)bytesRead);
+                        // Convert UTF-16 → UTF-8 for ConPTY input pipe
+                        var utf8 = Encoding.UTF8.GetBytes(charBuf, 0, (int)charsRead);
+                        _pty!.InputStream.Write(utf8, 0, utf8.Length);
                         _pty.InputStream.Flush();
                     }
                     catch (IOException) { break; }
