@@ -815,6 +815,10 @@ public class ConsoleWorker
             return SerializeResponse(new { error = "Missing 'command' field in request" });
         var timeoutMs = request.TryGetProperty("timeout", out var tp) ? tp.GetInt32() : 170_000;
 
+        // Reject if another command is still running (e.g., timed-out command in background)
+        if (_tracker.Busy)
+            return SerializeResponse(new { status = "busy", command });
+
         // Register command with tracker (it will resolve when OSC PromptStart arrives)
         var resultTask = _tracker.RegisterCommand(command, timeoutMs);
 

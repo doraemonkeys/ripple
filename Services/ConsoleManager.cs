@@ -265,12 +265,14 @@ public class ConsoleManager
                 timeout = timeoutSeconds * 1000,
             }, TimeSpan.FromSeconds(timeoutSeconds + 5));
 
-            // Check if the worker reported a command timeout
+            // Check if the worker reported a command timeout or busy
             var timedOut = response.TryGetProperty("timedOut", out var toProp) && toProp.GetBoolean();
-            if (timedOut)
+            var busy = response.TryGetProperty("status", out var stProp) && stProp.GetString() == "busy";
+            if (timedOut || busy)
             {
                 var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
-                return new ExecuteResult { TimedOut = true, DisplayName = displayName, Command = command };
+                var shellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily;
+                return new ExecuteResult { TimedOut = true, DisplayName = displayName, ShellFamily = shellFamily, Command = command };
             }
 
             var output = response.TryGetProperty("output", out var outputProp) ? outputProp.GetString() ?? "" : "";
