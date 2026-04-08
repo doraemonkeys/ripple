@@ -61,15 +61,15 @@ public class ShellTools
 
         string response;
         if (result.TimedOut)
-            response = $"⧗ {result.DisplayName} | Status: Busy | Pipeline: {result.Command}\nUse wait_for_completion tool to wait and retrieve the result.";
+        {
+            var shellInfo = result.ShellFamily != null ? $" ({result.ShellFamily})" : "";
+            response = $"⧗ {result.DisplayName}{shellInfo} | Status: Busy | Pipeline: {result.Command}\nUse wait_for_completion tool to wait and retrieve the result.";
+        }
         else if (result.Switched)
             response = result.Output ?? "";
         else
         {
-            var cwdInfo = result.Cwd != null ? $" | Location: {result.Cwd}" : "";
-            var statusLine = result.ExitCode == 0
-                ? $"✓ {result.DisplayName} | Status: Completed | Pipeline: {result.Command} | Duration: {result.Duration}s{cwdInfo}"
-                : $"✗ {result.DisplayName} | Status: Failed (exit {result.ExitCode}) | Pipeline: {result.Command} | Duration: {result.Duration}s{cwdInfo}";
+            var statusLine = FormatStatusLine(result);
             response = $"{statusLine}\n\n{(string.IsNullOrEmpty(result.Output) ? "(no output)" : result.Output)}";
         }
 
@@ -95,11 +95,7 @@ public class ShellTools
         var sb = new StringBuilder();
         foreach (var r in results)
         {
-            var cwdInfo = r.Cwd != null ? $" | Location: {r.Cwd}" : "";
-            var statusLine = r.ExitCode == 0
-                ? $"✓ {r.DisplayName} | Status: Completed | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}"
-                : $"✗ {r.DisplayName} | Status: Failed (exit {r.ExitCode}) | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}";
-            sb.AppendLine(statusLine);
+            sb.AppendLine(FormatStatusLine(r));
             sb.AppendLine();
             sb.AppendLine(string.IsNullOrEmpty(r.Output) ? "(no output)" : r.Output);
             sb.AppendLine();
@@ -108,7 +104,20 @@ public class ShellTools
     }
 
     /// <summary>
-    /// Collect cached outputs from all consoles and append to the response.
+    /// Format a status line for a completed/failed command result.
+    /// Includes console name, shell type, status, pipeline, duration, and location.
+    /// </summary>
+    private static string FormatStatusLine(ConsoleManager.ExecuteResult r)
+    {
+        var shell = r.ShellFamily != null ? $" ({r.ShellFamily})" : "";
+        var cwdInfo = r.Cwd != null ? $" | Location: {r.Cwd}" : "";
+        return r.ExitCode == 0
+            ? $"✓ {r.DisplayName}{shell} | Status: Completed | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}"
+            : $"✗ {r.DisplayName}{shell} | Status: Failed (exit {r.ExitCode}) | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}";
+    }
+
+    /// <summary>
+    /// Collect cached outputs from all consoles and prepend to the response.
     /// Called at the very end of each tool, just before returning, so no
     /// cached results are missed due to processing delays.
     /// </summary>
@@ -120,11 +129,7 @@ public class ShellTools
         var sb = new StringBuilder();
         foreach (var r in cached)
         {
-            var cwdInfo = r.Cwd != null ? $" | Location: {r.Cwd}" : "";
-            var statusLine = r.ExitCode == 0
-                ? $"✓ {r.DisplayName} | Status: Completed | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}"
-                : $"✗ {r.DisplayName} | Status: Failed (exit {r.ExitCode}) | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}";
-            sb.AppendLine(statusLine);
+            sb.AppendLine(FormatStatusLine(r));
             sb.AppendLine();
             sb.AppendLine(string.IsNullOrEmpty(r.Output) ? "(no output)" : r.Output);
             sb.AppendLine();

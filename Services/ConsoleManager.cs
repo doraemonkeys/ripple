@@ -285,6 +285,7 @@ public class ConsoleManager
                 Duration = duration,
                 Command = command,
                 DisplayName = displayName2,
+                ShellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily,
                 Cwd = cwdResult,
             };
         }
@@ -544,7 +545,8 @@ public class ConsoleManager
                 var cacheStatus = cachedResp.TryGetProperty("status", out var cs) ? cs.GetString() : null;
                 if (cacheStatus != "ok") continue;
 
-                var displayName = _consoles.GetValueOrDefault(pid.Value)?.DisplayName ?? $"#{pid.Value}";
+                var consoleInfo = _consoles.GetValueOrDefault(pid.Value);
+                var displayName = consoleInfo?.DisplayName ?? $"#{pid.Value}";
                 results.Add(new ExecuteResult
                 {
                     Output = cachedResp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "",
@@ -552,6 +554,7 @@ public class ConsoleManager
                     Duration = cachedResp.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
                     Command = cachedResp.TryGetProperty("command", out var c) ? c.GetString() : null,
                     DisplayName = displayName,
+                    ShellFamily = consoleInfo?.ShellFamily,
                     Cwd = cachedResp.TryGetProperty("cwd", out var w) ? w.GetString() : null,
                 });
             }
@@ -597,7 +600,8 @@ public class ConsoleManager
                     var cacheStatus = cachedResp.TryGetProperty("status", out var cs) ? cs.GetString() : null;
                     if (cacheStatus != "ok") continue;
 
-                    var displayName = _consoles.GetValueOrDefault(pid.Value)?.DisplayName ?? $"#{pid.Value}";
+                    var consoleInfo2 = _consoles.GetValueOrDefault(pid.Value);
+                    var displayName = consoleInfo2?.DisplayName ?? $"#{pid.Value}";
                     results.Add(new ExecuteResult
                     {
                         Output = cachedResp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "",
@@ -605,6 +609,7 @@ public class ConsoleManager
                         Duration = cachedResp.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
                         Command = cachedResp.TryGetProperty("command", out var c) ? c.GetString() : null,
                         DisplayName = displayName,
+                        ShellFamily = consoleInfo2?.ShellFamily,
                         Cwd = cachedResp.TryGetProperty("cwd", out var w) ? w.GetString() : null,
                     });
                 }
@@ -861,6 +866,7 @@ public class ConsoleManager
         public string Duration { get; set; } = "0";
         public string? Command { get; set; }
         public string? DisplayName { get; set; }
+        public string? ShellFamily { get; set; }
         public string? Cwd { get; set; }
         public bool Switched { get; set; }
         public bool TimedOut { get; set; }
