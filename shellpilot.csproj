@@ -8,6 +8,12 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>shellpilot</AssemblyName>
     <RootNamespace>ShellPilot</RootNamespace>
+    <Version>0.1.0</Version>
+    <Authors>Yoshifumi Tsuda</Authors>
+    <Company>Yoshifumi Tsuda</Company>
+    <Product>shellpilot</Product>
+    <Description>Universal MCP server that exposes any shell (bash, pwsh, zsh) over ConPTY/PTY</Description>
+    <Copyright>Copyright (c) 2026 Yoshifumi Tsuda</Copyright>
   </PropertyGroup>
 
   <ItemGroup>
