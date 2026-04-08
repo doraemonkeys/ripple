@@ -174,6 +174,10 @@ public class ConsoleManager
         // Wait for the worker's Named Pipe server to become ready
         await WaitForPipeReadyAsync(pipeName, TimeSpan.FromSeconds(30));
 
+        // Set the console window title (owned format: "#PID Name")
+        try { await SendPipeRequestAsync(pipeName, new { type = "set_title", title = displayName }, TimeSpan.FromSeconds(3)); }
+        catch { /* best-effort */ }
+
         return new StartConsoleResult("started", pid, displayName);
     }
 
@@ -388,6 +392,10 @@ public class ConsoleManager
                         if (!_consoles.ContainsKey(pid.Value))
                             _consoles[pid.Value] = new ConsoleInfo(pipe, displayName);
                     }
+
+                    // Update window title (console may have been unowned with "____" title)
+                    try { await SendPipeRequestAsync(pipe, new { type = "set_title", title = displayName }, TimeSpan.FromSeconds(3)); }
+                    catch { /* best-effort */ }
 
                     return (pid.Value, displayName);
                 }

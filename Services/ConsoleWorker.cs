@@ -60,6 +60,9 @@ public class ConsoleWorker
         Console.InputEncoding = Encoding.UTF8;
         Console.OutputEncoding = Encoding.UTF8;
 
+        // Set initial window title (unowned format — proxy will update after claiming)
+        Console.Title = $"#{Environment.ProcessId} ____";
+
         // Enable Virtual Terminal Processing on stdout so the visible console
         // interprets ANSI/VT escape sequences (cursor movement, clear-to-EOL,
         // colors) emitted by the shell instead of writing them as literal chars.
@@ -161,9 +164,9 @@ public class ConsoleWorker
             }
             catch
             {
-                // Parent died — owned pipe will not be claimed again, but
-                // we keep serving the unowned pipe for future claim.
-                // Don't cancel — just stop monitoring.
+                // Parent died — revert to unowned title and keep serving
+                // the unowned pipe so another proxy can claim this console.
+                Console.Title = $"#{Environment.ProcessId} ____";
                 return;
             }
         }
@@ -761,6 +764,7 @@ public class ConsoleWorker
             "execute" => await HandleExecuteAsync(request, ct),
             "get_status" => SerializeResponse(new { status = Status, hasCachedOutput = _tracker.HasCachedOutput }),
             "get_cached_output" => HandleGetCachedOutput(),
+            "set_title" => HandleSetTitle(request),
             "ping" => SerializeResponse(new { status = "ok" }),
             _ => SerializeResponse(new { error = $"Unknown request type: {type}" }),
         };
@@ -820,6 +824,14 @@ public class ConsoleWorker
             command = cached.Command,
             duration = cached.Duration,
         });
+    }
+
+    private JsonElement HandleSetTitle(JsonElement request)
+    {
+        var title = request.TryGetProperty("title", out var tp) ? tp.GetString() : null;
+        if (title != null)
+            Console.Title = title;
+        return SerializeResponse(new { status = "ok" });
     }
 
     // --- Pipe protocol (length-prefixed JSON) ---
