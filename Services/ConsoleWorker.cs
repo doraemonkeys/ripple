@@ -506,8 +506,9 @@ public class ConsoleWorker
                     if (!ReadConsoleW(hStdIn, charBuf, (uint)charBuf.Length, out var charsRead, IntPtr.Zero) || charsRead == 0)
                         break;
 
-                    // Don't forward while AI is executing — avoid mixed input
-                    if (_tracker.Busy) continue;
+                    // Always forward user input — the user must be able to
+                    // respond to confirmation prompts and send Ctrl+C even
+                    // while an AI-initiated command is running.
 
                     try
                     {
