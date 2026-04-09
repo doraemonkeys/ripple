@@ -332,8 +332,8 @@ public class ConsoleManager
 
         if (isSwitching && sourceCwd != null && sameShellFamily)
         {
-            // Switching to a same-shell console: prepend cd preamble so the user's
-            // command runs in the source cwd. This makes switching transparent.
+            // Same-shell switch with a known source cwd: prepend cd preamble so
+            // the user's command runs in the source cwd. Makes switching transparent.
             var cdPreamble = BuildCdPreamble(targetShellFamily!, sourceCwd);
             if (cdPreamble != null)
             {
@@ -347,7 +347,11 @@ public class ConsoleManager
         }
         else if (isSwitching)
         {
-            // Cross-shell switch (or no source cwd): cannot auto-cd. Warn user.
+            // Cases requiring user confirmation:
+            //   - Cross-shell switch with cwd (path translation not implemented)
+            //   - Fresh start (no previous active console — AI doesn't know cwd)
+            //   - Switch to standby with no source cwd
+            // Warn so AI verifies cwd and re-executes intentionally.
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
             return new ExecuteResult
             {
