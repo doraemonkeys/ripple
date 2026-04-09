@@ -3,3 +3,4 @@ obj/
 .vs/
 *.user
 test-cmd.md
+scratch/
