@@ -4,7 +4,7 @@
   <img src="https://github.com/user-attachments/assets/1343f694-1c05-4899-9faa-d2b1138aa3ba" alt="social-image" width="640" />
 </div>
 
-A universal MCP server that exposes any shell (bash, pwsh, powershell, zsh, cmd) as a Model Context Protocol server, so AI assistants can run real commands in a real terminal — visible to you, with session state that persists across calls.
+A universal MCP server that exposes any shell (bash, pwsh, powershell, cmd) as a Model Context Protocol server, so AI assistants can run real commands in a real terminal — visible to you, with session state that persists across calls.
 
 - **Real terminal, real output.** Commands run in a visible ConPTY-backed console. You see every character the AI types, just as if you typed it yourself.
 - **Multiple shells side by side.** bash, pwsh, cmd, and others can all be active at the same time. Switch between them per command.
@@ -88,7 +88,7 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
 
 | Tool | Description |
 |------|-------------|
-| `start_console` | Open a visible terminal window. Pick a shell (bash, pwsh, powershell, zsh, cmd, or a full path). Optional `cwd`, `banner`, and `reason` parameters. Reuses an existing standby of the same shell unless `reason` is provided. |
+| `start_console` | Open a visible terminal window. Pick a shell (bash, pwsh, powershell, cmd, or a full path). Optional `cwd`, `banner`, and `reason` parameters. Reuses an existing standby of the same shell unless `reason` is provided. |
 | `execute_command` | Run a pipeline. Optionally specify `shell` to target a specific shell type — finds an existing console of that shell, or auto-starts one. Times out cleanly with output cached for `wait_for_completion`. |
 | `wait_for_completion` | Block until busy consoles finish and retrieve cached output (use after a command times out). |
 
