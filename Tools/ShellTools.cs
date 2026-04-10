@@ -87,20 +87,32 @@ public class ShellTools
         CancellationToken cancellationToken = default)
     {
         var agentId = agent_id ?? "default";
-        var results = await consoleManager.WaitForCompletionAsync(timeout_seconds, agentId);
+        var result = await consoleManager.WaitForCompletionAsync(timeout_seconds, agentId);
 
-        if (results.Count == 0)
-            return "No completed results. Consoles may still be busy — try again later.";
+        if (result.HadNoBusyPids)
+            return await AppendCachedOutputs(consoleManager, agentId,
+                "No AI-initiated commands are currently running. Nothing to wait for.");
 
         var sb = new StringBuilder();
-        foreach (var r in results)
+        foreach (var r in result.Completed)
         {
             sb.AppendLine(FormatStatusLine(r));
             sb.AppendLine();
             sb.AppendLine(string.IsNullOrEmpty(r.Output) ? "(no output)" : r.Output);
             sb.AppendLine();
         }
-        return sb.ToString().TrimEnd();
+
+        if (result.StillBusy.Count > 0)
+        {
+            sb.AppendLine($"Still busy after {timeout_seconds}s. Call wait_for_completion again to keep waiting:");
+            foreach (var (_, displayName, shellFamily) in result.StillBusy)
+            {
+                var shell = shellFamily != null ? $" ({shellFamily})" : "";
+                sb.AppendLine($"  ⧗ {displayName}{shell}");
+            }
+        }
+
+        return await AppendCachedOutputs(consoleManager, agentId, sb.ToString().TrimEnd());
     }
 
     /// <summary>

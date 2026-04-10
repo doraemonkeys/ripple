@@ -22,7 +22,6 @@ public class ConsoleManager
     private readonly SemaphoreSlim _toolLock = new(1, 1);
     private readonly Dictionary<int, ConsoleInfo> _consoles = new();
     private readonly Dictionary<string, AgentSessionState> _agentSessions = new();
-    private readonly HashSet<int> _busyPids = new();
     private readonly HashSet<string> _allocatedSubAgentIds = new();
 
     // Category naming
@@ -97,6 +96,21 @@ public class ConsoleManager
             _agentSessions[agentId] = state;
         }
         return state;
+    }
+
+    private void MarkPipeBusy(string agentId, int pid)
+    {
+        lock (_lock) GetOrCreateAgentState(agentId).KnownBusyPids.Add(pid);
+    }
+
+    private void UnmarkPipeBusy(string agentId, int pid)
+    {
+        lock (_lock) GetOrCreateAgentState(agentId).KnownBusyPids.Remove(pid);
+    }
+
+    private List<int> SnapshotBusyPids(string agentId)
+    {
+        lock (_lock) return GetOrCreateAgentState(agentId).KnownBusyPids.ToList();
     }
 
     public string AllocateSubAgentId()
@@ -409,6 +423,7 @@ public class ConsoleManager
             {
                 var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
                 var shellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily;
+                MarkPipeBusy(agentId, consolePid);
                 return new ExecuteResult { TimedOut = true, DisplayName = displayName, ShellFamily = shellFamily, Command = command };
             }
 
@@ -440,12 +455,14 @@ public class ConsoleManager
         {
             // Pipe communication timeout (worker didn't respond in time)
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+            MarkPipeBusy(agentId, consolePid);
             return new ExecuteResult { TimedOut = true, DisplayName = displayName, Command = command };
         }
         catch (OperationCanceledException)
         {
             // Pipe CancellationToken fired
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+            MarkPipeBusy(agentId, consolePid);
             return new ExecuteResult { TimedOut = true, DisplayName = displayName, Command = command };
         }
         catch (IOException)
@@ -470,8 +487,8 @@ public class ConsoleManager
         {
             _consoles.Remove(consolePid);
             _pidToTitle.Remove(consolePid);
-            _busyPids.Remove(consolePid);
             var state = GetOrCreateAgentState(agentId);
+            state.KnownBusyPids.Remove(consolePid);
             if (state.ActivePid == consolePid)
                 state.ActivePid = 0;
         }
@@ -760,8 +777,8 @@ public class ConsoleManager
                 closed.Add((info.DisplayName, info.ShellFamily));
                 _consoles.Remove(pid);
                 _pidToTitle.Remove(pid);
-                _busyPids.Remove(pid);
                 var state = GetOrCreateAgentState(agentId);
+                state.KnownBusyPids.Remove(pid);
                 if (state.ActivePid == pid)
                     state.ActivePid = 0;
             }
@@ -806,6 +823,7 @@ public class ConsoleManager
                     ShellFamily = consoleInfo?.ShellFamily,
                     Cwd = cachedResp.TryGetProperty("cwd", out var w) ? w.GetString() : null,
                 });
+                UnmarkPipeBusy(agentId, pid.Value);
             }
             catch { }
         }
@@ -816,63 +834,142 @@ public class ConsoleManager
     // --- Wait for completion ---
 
     /// <summary>
-    /// Poll busy consoles for cached output (timed-out commands that have since completed).
-    /// Called from the WaitForCompletion MCP tool (proxy side).
+    /// Result of a wait_for_completion call. Distinguishes three states so the
+    /// tool can give the AI an actionable response:
+    ///   - HadNoBusyPids=true: nothing was running when the wait started → the
+    ///     AI should not keep calling wait_for_completion; there is nothing to wait for.
+    ///   - Completed has entries: one or more busy commands finished during the wait.
+    ///   - StillBusy has entries: wait timed out before these consoles finished;
+    ///     the AI can call wait_for_completion again to continue waiting.
     /// </summary>
-    public async Task<List<ExecuteResult>> WaitForCompletionAsync(int timeoutSeconds, string agentId)
+    public record WaitForCompletionResult(
+        List<ExecuteResult> Completed,
+        List<(int Pid, string DisplayName, string? ShellFamily)> StillBusy,
+        bool HadNoBusyPids);
+
+    /// <summary>
+    /// Wait for any commands this agent left running (execute_command returning
+    /// TimedOut) to finish, and drain their cached output. The set of "still
+    /// running" consoles is the KnownBusyPids tracked on the agent session.
+    ///
+    /// Contract:
+    ///   - If KnownBusyPids is empty on entry → return HadNoBusyPids=true
+    ///     immediately. The AI should report "nothing running" rather than loop.
+    ///   - Otherwise poll only those pipes until each one either produces cached
+    ///     output (completed/timed out from worker side) or its process dies
+    ///     (closed externally). Unmark busy on drain.
+    ///   - On overall timeout, return whatever we drained plus the set of pids
+    ///     that are still busy so the tool can report them.
+    /// </summary>
+    public async Task<WaitForCompletionResult> WaitForCompletionAsync(int timeoutSeconds, string agentId)
     {
-        var results = new List<ExecuteResult>();
+        var busyPids = SnapshotBusyPids(agentId);
+
+        // Drop any pids whose process is already dead — a console closed while
+        // still flagged busy counts as "not running anymore", and we don't want
+        // to pretend there's something to wait for.
+        for (int i = busyPids.Count - 1; i >= 0; i--)
+        {
+            if (!IsProcessAlive(busyPids[i]))
+            {
+                UnmarkPipeBusy(agentId, busyPids[i]);
+                busyPids.RemoveAt(i);
+            }
+        }
+
+        if (busyPids.Count == 0)
+        {
+            return new WaitForCompletionResult(
+                new List<ExecuteResult>(),
+                new List<(int, string, string?)>(),
+                HadNoBusyPids: true);
+        }
+
+        var completed = new List<ExecuteResult>();
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(timeoutSeconds);
 
-        while (DateTime.UtcNow < deadline)
+        while (busyPids.Count > 0 && DateTime.UtcNow < deadline)
         {
-            foreach (var pipe in EnumeratePipes(ProxyPid, agentId))
+            for (int i = busyPids.Count - 1; i >= 0; i--)
             {
-                var pid = GetPidFromPipeName(pipe);
-                if (!pid.HasValue) continue;
+                var pid = busyPids[i];
+
+                // Console process died while busy — stop waiting for it, and
+                // surface it in the result so the tool can show a notification.
+                if (!IsProcessAlive(pid))
+                {
+                    var info = _consoles.GetValueOrDefault(pid);
+                    completed.Add(new ExecuteResult
+                    {
+                        DisplayName = info?.DisplayName ?? $"#{pid}",
+                        ShellFamily = info?.ShellFamily,
+                        Output = "(console closed before command completed)",
+                        ExitCode = -1,
+                    });
+                    UnmarkPipeBusy(agentId, pid);
+                    busyPids.RemoveAt(i);
+                    continue;
+                }
+
+                string? pipeName;
+                lock (_lock) pipeName = _consoles.GetValueOrDefault(pid)?.PipePath;
+                if (pipeName == null)
+                {
+                    UnmarkPipeBusy(agentId, pid);
+                    busyPids.RemoveAt(i);
+                    continue;
+                }
 
                 try
                 {
-                    // Check status
-                    var statusResp = await SendPipeRequestAsync(pipe,
+                    var statusResp = await SendPipeRequestAsync(pipeName,
                         w => w.WriteString("type", "get_status"),
                         TimeSpan.FromSeconds(3));
 
                     var hasCached = statusResp.TryGetProperty("hasCachedOutput", out var hc) && hc.GetBoolean();
                     if (!hasCached) continue;
 
-                    // Retrieve cached output
-                    var cachedResp = await SendPipeRequestAsync(pipe,
+                    var cachedResp = await SendPipeRequestAsync(pipeName,
                         w => w.WriteString("type", "get_cached_output"),
                         TimeSpan.FromSeconds(5));
 
                     var cacheStatus = cachedResp.TryGetProperty("status", out var cs) ? cs.GetString() : null;
                     if (cacheStatus != "ok") continue;
 
-                    var consoleInfo2 = _consoles.GetValueOrDefault(pid.Value);
-                    var displayName = consoleInfo2?.DisplayName ?? $"#{pid.Value}";
-                    results.Add(new ExecuteResult
+                    var info2 = _consoles.GetValueOrDefault(pid);
+                    completed.Add(new ExecuteResult
                     {
                         Output = cachedResp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "",
                         ExitCode = cachedResp.TryGetProperty("exitCode", out var e) ? e.GetInt32() : 0,
                         Duration = cachedResp.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
                         Command = cachedResp.TryGetProperty("command", out var c) ? c.GetString() : null,
-                        DisplayName = displayName,
-                        ShellFamily = consoleInfo2?.ShellFamily,
+                        DisplayName = info2?.DisplayName ?? $"#{pid}",
+                        ShellFamily = info2?.ShellFamily,
                         Cwd = cachedResp.TryGetProperty("cwd", out var w) ? w.GetString() : null,
                     });
+                    UnmarkPipeBusy(agentId, pid);
+                    busyPids.RemoveAt(i);
                 }
                 catch
                 {
-                    // Skip unresponsive pipes
+                    // Transient pipe error — keep the pid in the busy list and
+                    // retry on the next poll tick.
                 }
             }
 
-            if (results.Count > 0) break;
-            await Task.Delay(500);
+            if (busyPids.Count == 0) break;
+            await Task.Delay(300);
         }
 
-        return results;
+        var stillBusy = busyPids
+            .Select(pid =>
+            {
+                var info = _consoles.GetValueOrDefault(pid);
+                return (pid, info?.DisplayName ?? $"#{pid}", info?.ShellFamily);
+            })
+            .ToList();
+
+        return new WaitForCompletionResult(completed, stillBusy, HadNoBusyPids: false);
     }
 
     // --- Pipe enumeration ---
