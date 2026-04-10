@@ -46,6 +46,7 @@ public class CommandTracker
     private string? _cwd;
     private string _commandSent = "";
     private bool _captureEnabled = true;
+    private bool _stripAcceptLineNoise = false; // true for pwsh: strip AcceptLine rendering before first \r\n
     private Stopwatch? _stopwatch;
     private CancellationTokenSource? _settleCts;
 
@@ -114,6 +115,7 @@ public class CommandTracker
         lock (_lock)
         {
             _captureEnabled = false;
+            _stripAcceptLineNoise = true;
             _ = Task.Delay(2000).ContinueWith(_ =>
             {
                 lock (_lock) { if (!_captureEnabled) _captureEnabled = true; }
@@ -237,14 +239,17 @@ public class CommandTracker
 
     private string CleanOutput()
     {
-        // With OSC B gating, _output starts just after the OSC B signal.
-        // AcceptLine() then renders the command line and emits a hard \r\n.
-        // Everything before (and including) that first \r\n is PSReadLine
-        // rendering noise; actual command output starts after it.
         var raw = _output;
-        int firstHardNewline = raw.IndexOf("\r\n");
-        if (firstHardNewline >= 0)
-            raw = raw[(firstHardNewline + 2)..];
+
+        // For pwsh: everything before the first hard \r\n is AcceptLine rendering noise.
+        // (PSReadLine uses soft \r to overwrite ghost text; the \r\n marks end of input line.)
+        // Not applied to bash/zsh where OSC B is not emitted per-command.
+        if (_stripAcceptLineNoise)
+        {
+            int firstHardNewline = raw.IndexOf("\r\n");
+            if (firstHardNewline >= 0)
+                raw = raw[(firstHardNewline + 2)..];
+        }
 
         var output = StripAnsi(raw);
         var lines = output.Split('\n');
@@ -308,6 +313,7 @@ public class CommandTracker
         _commandSent = "";
         _stopwatch = null;
         _captureEnabled = true;
+        _stripAcceptLineNoise = false;
     }
 
     private static string StripAnsi(string text)
