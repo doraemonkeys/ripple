@@ -1057,9 +1057,10 @@ public class ConsoleManager
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            var envShell = Environment.GetEnvironmentVariable("SPLASHSHELL_SHELL");
-            if (!string.IsNullOrEmpty(envShell)) return envShell;
-            return "pwsh.exe";
+            // Prefer pwsh (PowerShell 7); fall back to Windows PowerShell 5.1 if absent.
+            var pwshResolved = ResolveShellPath("pwsh.exe");
+            if (File.Exists(pwshResolved)) return "pwsh.exe";
+            return "powershell.exe";
         }
         return Environment.GetEnvironmentVariable("SHELL") ?? "bash";
     }
