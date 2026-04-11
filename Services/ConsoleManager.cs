@@ -191,11 +191,7 @@ public class ConsoleManager
                                 w.WriteString("command", cdPreamble.TrimEnd('&', ' '));
                                 w.WriteNumber("timeout", 5000);
                             }, TimeSpan.FromSeconds(8));
-                            lock (_lock)
-                            {
-                                var info = _consoles.GetValueOrDefault(standby.Value.Pid);
-                                if (info != null) info.LastAiCwd = cwd;
-                            }
+                            UpdateConsoleInfo(standby.Value.Pid, info => info.LastAiCwd = cwd);
                         }
                         catch { /* best-effort */ }
                     }
@@ -232,13 +228,7 @@ public class ConsoleManager
         // (e.g., /mnt/c/foo for WSL bash, C:\foo for pwsh).
         var initialCwd = await QueryConsoleCwdAsync(pipeName);
         if (initialCwd != null)
-        {
-            lock (_lock)
-            {
-                var info = _consoles.GetValueOrDefault(pid);
-                if (info != null) info.LastAiCwd = initialCwd;
-            }
-        }
+            UpdateConsoleInfo(pid, info => info.LastAiCwd = initialCwd);
 
         try { await SendPipeRequestAsync(pipeName, w => { w.WriteString("type", "set_title"); w.WriteString("title", displayName); }, TimeSpan.FromSeconds(3)); }
         catch { /* best-effort */ }
@@ -455,11 +445,7 @@ public class ConsoleManager
             if (cdPreamble != null)
             {
                 executedCommand = cdPreamble + command;
-                lock (_lock)
-                {
-                    var info = _consoles.GetValueOrDefault(consolePid);
-                    if (info != null) info.LastAiCwd = preambleCwd;
-                }
+                UpdateConsoleInfo(consolePid, info => info.LastAiCwd = preambleCwd);
             }
 
             if (sourceDrifted)
@@ -508,7 +494,7 @@ public class ConsoleManager
 
             if (IsCwdDrifted(lastAiCwd, currentCwd))
             {
-                lock (_lock) { if (consoleInfo != null) consoleInfo.LastAiCwd = currentCwd; }
+                UpdateConsoleInfo(consolePid, info => info.LastAiCwd = currentCwd);
                 var displayName = consoleInfo?.DisplayName ?? $"#{consolePid}";
                 return new ExecutionPlan(consolePid, pipeName, executedCommand, routingNotice,
                     EarlyResult: new ExecuteResult
@@ -549,11 +535,7 @@ public class ConsoleManager
             // Record the AI-visible command for this console so background
             // busy reports can show what the AI asked for, not the preamble-
             // augmented string the worker actually runs.
-            lock (_lock)
-            {
-                var ci = _consoles.GetValueOrDefault(consolePid);
-                if (ci != null) ci.LastAiCommand = command;
-            }
+            UpdateConsoleInfo(consolePid, ci => ci.LastAiCommand = command);
 
             var response = await SendPipeRequestAsync(pipeName, w =>
             {
@@ -629,11 +611,8 @@ public class ConsoleManager
             }
 
             // Update LastAiCwd with the result cwd (the cwd the command ended at)
-            lock (_lock)
-            {
-                var info2 = _consoles.GetValueOrDefault(consolePid);
-                if (info2 != null && cwdResult != null) info2.LastAiCwd = cwdResult;
-            }
+            if (cwdResult != null)
+                UpdateConsoleInfo(consolePid, info => info.LastAiCwd = cwdResult);
 
             return new ExecuteResult
             {
@@ -800,6 +779,22 @@ public class ConsoleManager
     internal static bool IsCwdDrifted(string? lastAiCwd, string? liveCwd)
         => lastAiCwd != null && liveCwd != null
            && !liveCwd.Equals(lastAiCwd, PathComparison);
+
+    /// <summary>
+    /// Apply an update to a tracked console's info under _lock. Consolidates
+    /// the "look up _consoles[pid], if non-null mutate" pattern that used to
+    /// live inline at every LastAiCwd / LastAiCommand assignment site, so
+    /// all writes now go through one well-defined critical section. No-op
+    /// if the console has been removed in the meantime.
+    /// </summary>
+    private void UpdateConsoleInfo(int pid, Action<ConsoleInfo> update)
+    {
+        lock (_lock)
+        {
+            var info = _consoles.GetValueOrDefault(pid);
+            if (info != null) update(info);
+        }
+    }
 
     private async Task<(int Pid, string DisplayName)?> TryFindInPipesAsync(IEnumerable<string> pipes, string? shellPath = null)
     {
