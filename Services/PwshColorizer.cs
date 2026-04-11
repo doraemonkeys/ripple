@@ -38,9 +38,37 @@ internal static class PwshColorizer
     private const string Parameter = "\x1b[90m";  // DarkGray
     private const string String_   = "\x1b[36m";  // DarkCyan
     private const string Variable  = "\x1b[92m";  // Green
+    private const string Keyword   = "\x1b[92m";  // Green (PSReadLine default)
     private const string Number    = "\x1b[97m";  // White
     private const string Operator  = "\x1b[90m";  // DarkGray
     private const string Comment   = "\x1b[32m";  // DarkGreen
+
+    // PowerShell reserved keywords. Matched case-insensitively so `FOREACH`
+    // and `Foreach` are both colored. Mirrors the set flagged with
+    // TokenFlags.Keyword by System.Management.Automation.Language.Parser —
+    // splash can't reference that assembly under NativeAOT, so we hard-code
+    // the list instead.
+    // Authoritative list copied from PowerShell's tokenizer.cs s_keywordText
+    // (System.Management.Automation/engine/parser/tokenizer.cs:625-639). Every
+    // entry here corresponds to a TokenKind whose traits include
+    // TokenFlags.Keyword in token.cs:903-954, which is exactly what PSReadLine
+    // checks to color tokens with _keywordColor.
+    private static readonly HashSet<string> Keywords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "elseif", "if", "else", "switch",
+        "foreach", "from", "in", "for",
+        "while", "until", "do", "try",
+        "catch", "finally", "trap", "data",
+        "return", "continue", "break", "exit",
+        "throw", "begin", "process", "end",
+        "dynamicparam", "function", "filter", "param",
+        "class", "define", "var", "using",
+        "workflow", "parallel", "sequence", "inlinescript",
+        "configuration", "public", "private", "static",
+        "interface", "enum", "namespace", "module",
+        "type", "assembly", "command", "hidden",
+        "base", "default", "clean",
+    };
 
     public static string Colorize(string command)
     {
@@ -76,27 +104,97 @@ internal static class PwshColorizer
                 continue;
             }
 
-            // Strings — single or double quoted. PowerShell uses backtick
-            // as the escape character inside double-quoted strings; single-
-            // quoted strings don't process escapes. We accept both as a
-            // single token without trying to highlight interpolations.
-            if (c == '\'' || c == '"')
+            // Strings. Single-quoted strings are literal with no escapes.
+            // Double-quoted strings are expandable — embedded $var, ${var},
+            // and $(expr) interpolations are highlighted as Variable just
+            // like PSReadLine's StringExpandableToken handling in
+            // Render.cs:596-619.
+            if (c == '\'')
             {
                 int start = i;
-                char quote = c;
                 i++;
                 while (i < len)
                 {
+                    if (command[i] == '\'') { i++; break; }
+                    i++;
+                }
+                sb.Append(String_).Append(command, start, i - start).Append(Reset);
+                atCommandPosition = false;
+                continue;
+            }
+            if (c == '"')
+            {
+                sb.Append(String_).Append('"');
+                i++;
+                int segStart = i;
+                bool closed = false;
+                while (i < len)
+                {
                     char q = command[i];
-                    if (quote == '"' && q == '`' && i + 1 < len)
+                    if (q == '`' && i + 1 < len)
                     {
                         i += 2;
                         continue;
                     }
-                    if (q == quote) { i++; break; }
+                    if (q == '"')
+                    {
+                        if (i > segStart) sb.Append(command, segStart, i - segStart);
+                        sb.Append('"').Append(Reset);
+                        i++;
+                        closed = true;
+                        break;
+                    }
+                    if (q == '$' && i + 1 < len)
+                    {
+                        char next = command[i + 1];
+                        bool isInterpolation = next == '(' || next == '{'
+                            || char.IsLetter(next) || next == '_';
+                        if (isInterpolation)
+                        {
+                            if (i > segStart) sb.Append(command, segStart, i - segStart);
+                            sb.Append(Reset);
+                            int varStart = i;
+                            i++;
+                            if (command[i] == '{')
+                            {
+                                int depth = 1;
+                                i++;
+                                while (i < len && depth > 0)
+                                {
+                                    if (command[i] == '{') depth++;
+                                    else if (command[i] == '}') depth--;
+                                    i++;
+                                }
+                            }
+                            else if (command[i] == '(')
+                            {
+                                int depth = 1;
+                                i++;
+                                while (i < len && depth > 0)
+                                {
+                                    if (command[i] == '(') depth++;
+                                    else if (command[i] == ')') depth--;
+                                    i++;
+                                }
+                            }
+                            else
+                            {
+                                while (i < len && (char.IsLetterOrDigit(command[i]) || command[i] == '_' || command[i] == ':'))
+                                    i++;
+                            }
+                            sb.Append(Variable).Append(command, varStart, i - varStart).Append(Reset);
+                            sb.Append(String_);
+                            segStart = i;
+                            continue;
+                        }
+                    }
                     i++;
                 }
-                sb.Append(String_).Append(command, start, i - start).Append(Reset);
+                if (!closed)
+                {
+                    if (i > segStart) sb.Append(command, segStart, i - segStart);
+                    sb.Append(Reset);
+                }
                 atCommandPosition = false;
                 continue;
             }
@@ -177,11 +275,13 @@ internal static class PwshColorizer
                 continue;
             }
 
-            // Command-position identifier: cmdlet name (e.g. Get-ChildItem,
-            // Set-Location, dotnet) or a simple function. Only colors the
-            // FIRST identifier of the statement. Subsequent barewords are
-            // arguments and keep the default color.
-            if (atCommandPosition && (char.IsLetter(c) || c == '_'))
+            // Identifier — could be a PowerShell keyword, a cmdlet/function
+            // name in command position, or a bareword argument. We always
+            // run the identifier scanner (even mid-statement) so that
+            // keywords like `in` inside `foreach ($x in $xs)` or `else` in
+            // `if { } else { }` get colored green regardless of whether
+            // we'd otherwise consider the position a command position.
+            if (char.IsLetter(c) || c == '_')
             {
                 int start = i;
                 while (i < len)
@@ -191,8 +291,41 @@ internal static class PwshColorizer
                         i++;
                     else break;
                 }
-                sb.Append(Command).Append(command, start, i - start).Append(Reset);
-                atCommandPosition = false;
+                int length = i - start;
+                if (Keywords.Contains(command.Substring(start, length)))
+                {
+                    sb.Append(Keyword).Append(command, start, length).Append(Reset);
+                    atCommandPosition = false;
+                }
+                else if (atCommandPosition)
+                {
+                    sb.Append(Command).Append(command, start, length).Append(Reset);
+                    atCommandPosition = false;
+                }
+                else
+                {
+                    sb.Append(command, start, length);
+                }
+                continue;
+            }
+
+            // Scriptblock braces. `{` opens a new statement context so the
+            // next identifier inside (e.g. `Write-Host` inside
+            // `foreach (...) { Write-Host ... }`) is colored as a command.
+            // Only reset command position when `{` is preceded by obvious
+            // statement boundaries — otherwise braces embedded in a path
+            // like `C:\Users\{user}\` would wrongly re-enter command mode.
+            if (c == '{' || c == '}')
+            {
+                sb.Append(c);
+                if (c == '{')
+                {
+                    char prev = i > 0 ? command[i - 1] : ' ';
+                    if (prev == ' ' || prev == '\t' || prev == '\n' || prev == '\r'
+                        || prev == ')' || prev == '=' || prev == ';' || prev == '|')
+                        atCommandPosition = true;
+                }
+                i++;
                 continue;
             }
 
@@ -221,7 +354,7 @@ internal static class PwshColorizer
                     char cc = command[i];
                     if (cc == ' ' || cc == '\t' || cc == '\r' || cc == '\n' ||
                         cc == '\'' || cc == '"' || cc == '$' || cc == ';' ||
-                        cc == '|' || cc == '&' || cc == '#')
+                        cc == '|' || cc == '&' || cc == '#' || cc == '{' || cc == '}')
                         break;
                     i++;
                 }

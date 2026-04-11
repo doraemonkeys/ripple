@@ -14,6 +14,7 @@ public class PwshColorizerTests
     private const string Parameter = "\x1b[90m";
     private const string String_   = "\x1b[36m";
     private const string Variable  = "\x1b[92m";
+    private const string Keyword   = "\x1b[92m";
     private const string Number    = "\x1b[97m";
     private const string Operator  = "\x1b[90m";
     private const string Comment   = "\x1b[32m";
@@ -144,6 +145,82 @@ public class PwshColorizerTests
             var cmd = "Get-Date";
             var r = PwshColorizer.Colorize(cmd);
             Assert(!r.Contains(Parameter), "Get-Date does not contain parameter color");
+        }
+
+        // 12. Keywords are colored as Keyword (green), not Command (yellow).
+        //     `foreach` at statement start and `in` mid-expression must
+        //     both be recognized.
+        {
+            var cmd = "foreach ($i in $items) { Write-Host $i }";
+            var r = PwshColorizer.Colorize(cmd);
+            AssertContains(r, $"{Keyword}foreach{Reset}", "foreach colored as keyword");
+            AssertContains(r, $"{Keyword}in{Reset}", "in colored as keyword");
+            AssertContains(r, $"{Command}Write-Host{Reset}", "Write-Host inside scriptblock colored as command");
+            Assert(!r.Contains($"{Command}foreach{Reset}"), "foreach is not colored as command");
+            Assert(StripAnsi(r) == cmd, "foreach block text preserved");
+        }
+
+        // 13. if/else keywords and the command inside the else branch.
+        {
+            var cmd = "if ($x -gt 0) { Write-Host ok } else { Write-Error bad }";
+            var r = PwshColorizer.Colorize(cmd);
+            AssertContains(r, $"{Keyword}if{Reset}", "if colored as keyword");
+            AssertContains(r, $"{Keyword}else{Reset}", "else colored as keyword");
+            AssertContains(r, $"{Command}Write-Host{Reset}", "Write-Host in if-branch is command");
+            AssertContains(r, $"{Command}Write-Error{Reset}", "Write-Error in else-branch is command");
+        }
+
+        // 14. The exact user-reported case — keyword, scriptblock command,
+        //     variable interpolation, parameter, and trailing comment.
+        {
+            var cmd = "$items = @('apple', 'banana', 'cherry'); foreach ($i in $items) { Write-Host \"- $i\" -ForegroundColor Yellow } # comment at end";
+            var r = PwshColorizer.Colorize(cmd);
+            AssertContains(r, $"{Variable}$items{Reset}", "$items variable colored");
+            AssertContains(r, $"{Keyword}foreach{Reset}", "foreach keyword green");
+            AssertContains(r, $"{Keyword}in{Reset}", "in keyword green");
+            AssertContains(r, $"{Command}Write-Host{Reset}", "Write-Host inside block is command yellow");
+            AssertContains(r, $"{Parameter}-ForegroundColor{Reset}", "-ForegroundColor parameter colored");
+            AssertContains(r, $"{Comment}# comment at end{Reset}", "trailing comment colored");
+            Assert(StripAnsi(r) == cmd, "user-reported command preserved verbatim");
+        }
+
+        // 14b. Variable interpolation inside a double-quoted string is
+        //      colored as Variable, with the surrounding literal still
+        //      wrapped in String color.
+        {
+            var cmd = "Write-Host \"- $i\"";
+            var r = PwshColorizer.Colorize(cmd);
+            AssertContains(r, $"{String_}\"- {Reset}", "string opens with literal segment");
+            AssertContains(r, $"{Variable}$i{Reset}", "$i inside string colored as variable");
+            AssertContains(r, $"{String_}\"{Reset}", "string closes after interpolation");
+            Assert(StripAnsi(r) == cmd, "interpolated string preserved verbatim");
+        }
+
+        // 14c. $(...) subexpression inside a double-quoted string.
+        {
+            var cmd = "Write-Host \"time=$(Get-Date)\"";
+            var r = PwshColorizer.Colorize(cmd);
+            AssertContains(r, $"{Variable}$(Get-Date){Reset}", "$(Get-Date) inside string colored as variable");
+            Assert(StripAnsi(r) == cmd, "subexpression interpolation preserved");
+        }
+
+        // 14d. Single-quoted strings are literal — a $ inside must NOT be
+        //      split out as a variable.
+        {
+            var cmd = "Write-Output 'literal $i here'";
+            var r = PwshColorizer.Colorize(cmd);
+            AssertContains(r, $"{String_}'literal $i here'{Reset}", "single-quoted string slurps $ as literal");
+            Assert(!r.Contains($"{Variable}$i"), "single-quoted $i is NOT variable-colored");
+        }
+
+        // 15. Scriptblock brace inside a path must NOT reset command position
+        //     (so `user` in `C:\Users\{user}\` doesn't become yellow).
+        {
+            var cmd = "Set-Location C:\\Users\\{user}\\Documents";
+            var r = PwshColorizer.Colorize(cmd);
+            AssertContains(r, $"{Command}Set-Location{Reset}", "cmdlet colored");
+            Assert(!r.Contains($"{Command}user{Reset}"), "brace-embedded `user` is NOT colored as command");
+            Assert(StripAnsi(r) == cmd, "path-with-braces preserved");
         }
 
         Console.WriteLine($"\n{pass} passed, {fail} failed");
