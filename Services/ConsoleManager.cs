@@ -398,6 +398,7 @@ public class ConsoleManager
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
             return new ExecuteResult
             {
+                Pid = consolePid,
                 Switched = true,
                 DisplayName = displayName,
                 Output = $"Switched to console {displayName}. Pipeline NOT executed — cd to the correct directory and re-execute.",
@@ -422,6 +423,7 @@ public class ConsoleManager
                 var displayName = consoleInfo?.DisplayName ?? $"#{consolePid}";
                 return new ExecuteResult
                 {
+                    Pid = consolePid,
                     Switched = true,
                     DisplayName = displayName,
                     Output = $"Console {displayName} cwd is now '{currentCwd}' (was '{lastAiCwd}'). Pipeline NOT executed — verify and re-execute.",
@@ -447,7 +449,7 @@ public class ConsoleManager
                 var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
                 var shellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily;
                 MarkPipeBusy(agentId, consolePid);
-                return new ExecuteResult { TimedOut = true, DisplayName = displayName, ShellFamily = shellFamily, Command = command };
+                return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, ShellFamily = shellFamily, Command = command };
             }
 
             var output = response.TryGetProperty("output", out var outputProp) ? outputProp.GetString() ?? "" : "";
@@ -465,6 +467,7 @@ public class ConsoleManager
 
             return new ExecuteResult
             {
+                Pid = consolePid,
                 Output = output,
                 ExitCode = exitCode,
                 Duration = duration,
@@ -479,14 +482,14 @@ public class ConsoleManager
             // Pipe communication timeout (worker didn't respond in time)
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
             MarkPipeBusy(agentId, consolePid);
-            return new ExecuteResult { TimedOut = true, DisplayName = displayName, Command = command };
+            return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, Command = command };
         }
         catch (OperationCanceledException)
         {
             // Pipe CancellationToken fired
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
             MarkPipeBusy(agentId, consolePid);
-            return new ExecuteResult { TimedOut = true, DisplayName = displayName, Command = command };
+            return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, Command = command };
         }
         catch (IOException)
         {
@@ -494,6 +497,7 @@ public class ConsoleManager
             var startResult = await StartConsoleInnerAsync(shell ?? GetDefaultShell(), null, null, agentId);
             return new ExecuteResult
             {
+                Pid = startResult.Pid,
                 Switched = true,
                 DisplayName = startResult.DisplayName,
                 Output = $"Previous console died. Switched to {startResult.DisplayName}. Pipeline NOT executed — re-execute.",
@@ -829,6 +833,7 @@ public class ConsoleManager
                 var displayName = consoleInfo?.DisplayName ?? $"#{pid.Value}";
                 results.Add(new ExecuteResult
                 {
+                    Pid = pid.Value,
                     Output = cachedResp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "",
                     ExitCode = cachedResp.TryGetProperty("exitCode", out var e) ? e.GetInt32() : 0,
                     Duration = cachedResp.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
@@ -843,6 +848,88 @@ public class ConsoleManager
         }
 
         return results;
+    }
+
+    /// <summary>
+    /// Snapshot of a busy console's running command for reporting to the AI
+    /// at the end of unrelated tool calls. Used to keep the AI aware of
+    /// long-running work on other consoles instead of silently forgetting them.
+    /// </summary>
+    public record BusyStatus(
+        int Pid,
+        string DisplayName,
+        string? ShellFamily,
+        string? RunningCommand,
+        double? ElapsedSeconds);
+
+    /// <summary>
+    /// Report currently-busy consoles (other than any caller-excluded one)
+    /// so the caller can prepend their status to the next response. Only
+    /// includes pids we know are busy from KnownBusyPids — pipes whose status
+    /// query fails or that have gone quiet are dropped from the tracking set
+    /// as a side effect, keeping the set honest.
+    /// </summary>
+    public async Task<List<BusyStatus>> CollectBusyStatusesAsync(string agentId, int excludePid = 0)
+    {
+        var report = new List<BusyStatus>();
+        var busyPids = SnapshotBusyPids(agentId);
+
+        foreach (var pid in busyPids)
+        {
+            if (pid == excludePid) continue;
+
+            if (!IsProcessAlive(pid))
+            {
+                UnmarkPipeBusy(agentId, pid);
+                continue;
+            }
+
+            string? pipeName;
+            ConsoleInfo? info;
+            lock (_lock)
+            {
+                info = _consoles.GetValueOrDefault(pid);
+                pipeName = info?.PipePath;
+            }
+            if (pipeName == null)
+            {
+                UnmarkPipeBusy(agentId, pid);
+                continue;
+            }
+
+            try
+            {
+                var statusResp = await SendPipeRequestAsync(pipeName,
+                    w => w.WriteString("type", "get_status"),
+                    TimeSpan.FromSeconds(3));
+
+                var statusStr = statusResp.TryGetProperty("status", out var st) ? st.GetString() : null;
+                if (statusStr != "busy")
+                {
+                    // Worker is no longer running this command. Either the
+                    // result is already cached (drained elsewhere) or the
+                    // tracking was stale. CollectCachedOutputsAsync /
+                    // WaitForCompletionAsync will handle drains; here we just
+                    // skip — do not report a stale busy entry.
+                    continue;
+                }
+
+                var cmd = statusResp.TryGetProperty("runningCommand", out var rc) ? rc.GetString() : null;
+                double? elapsed = null;
+                if (statusResp.TryGetProperty("runningElapsedSeconds", out var esProp)
+                    && esProp.ValueKind == JsonValueKind.Number)
+                    elapsed = esProp.GetDouble();
+
+                report.Add(new BusyStatus(pid, info?.DisplayName ?? $"#{pid}", info?.ShellFamily, cmd, elapsed));
+            }
+            catch
+            {
+                // Transient pipe error — keep the pid flagged, try again next
+                // time. Do not report a partial entry.
+            }
+        }
+
+        return report;
     }
 
     // --- Wait for completion ---
@@ -1331,6 +1418,7 @@ public class ConsoleManager
 
     public class ExecuteResult
     {
+        public int Pid { get; set; }
         public string Output { get; set; } = "";
         public int ExitCode { get; set; }
         public string Duration { get; set; } = "0";

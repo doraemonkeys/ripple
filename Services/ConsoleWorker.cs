@@ -855,6 +855,10 @@ public class ConsoleWorker
                 w.WriteString("shellFamily", Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant());
                 w.WriteString("shellPath", _shell);
                 w.WriteStringOrNull("cwd", _tracker.LastKnownCwd);
+                w.WriteStringOrNull("runningCommand", _tracker.RunningCommand);
+                var elapsed = _tracker.RunningElapsedSeconds;
+                if (elapsed.HasValue) w.WriteNumber("runningElapsedSeconds", elapsed.Value);
+                else w.WriteNull("runningElapsedSeconds");
             }),
             "get_cached_output" => HandleGetCachedOutput(),
             "set_title" => HandleSetTitle(request),

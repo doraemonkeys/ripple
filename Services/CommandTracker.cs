@@ -62,6 +62,24 @@ public class CommandTracker
     public bool Busy => _isAiCommand || _userCommandBusy;
     public bool HasCachedOutput => _cachedResult != null;
 
+    /// <summary>
+    /// Text of the AI command currently executing, or null when idle / the
+    /// active command is user-initiated (we don't know what the human typed).
+    /// </summary>
+    public string? RunningCommand
+    {
+        get { lock (_lock) return _isAiCommand ? _commandSent : null; }
+    }
+
+    /// <summary>
+    /// Elapsed seconds since the current AI command was registered, or null
+    /// when no AI command is tracked.
+    /// </summary>
+    public double? RunningElapsedSeconds
+    {
+        get { lock (_lock) return _isAiCommand ? _stopwatch?.Elapsed.TotalSeconds : null; }
+    }
+
     public record CommandResult(string Output, int ExitCode, string? Cwd, string? Command, string Duration);
 
     /// <summary>

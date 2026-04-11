@@ -75,7 +75,7 @@ public class ShellTools
             response = $"{statusLine}\n\n{(string.IsNullOrEmpty(result.Output) ? "(no output)" : result.Output)}";
         }
 
-        return await AppendCachedOutputs(consoleManager, agentId, response);
+        return await AppendCachedOutputs(consoleManager, agentId, response, excludePid: result.Pid);
     }
 
     [McpServerTool]
@@ -131,16 +131,19 @@ public class ShellTools
     }
 
     /// <summary>
-    /// Detect closed consoles and collect cached outputs, prepending notifications
-    /// to the response. Called at the very end of each tool, just before returning,
-    /// so no cached results or close events are missed due to processing delays.
+    /// Detect closed consoles, collect cached outputs, and report busy
+    /// consoles other than the one this tool just used. Everything gets
+    /// prepended to the response so the AI stays aware of background work
+    /// on consoles it isn't currently acting on. Pass excludePid to keep
+    /// the response free of a duplicate busy line for the current console.
     /// </summary>
-    private static async Task<string> AppendCachedOutputs(ConsoleManager consoleManager, string agentId, string response)
+    private static async Task<string> AppendCachedOutputs(ConsoleManager consoleManager, string agentId, string response, int excludePid = 0)
     {
         var closed = consoleManager.DetectClosedConsoles(agentId);
         var cached = await consoleManager.CollectCachedOutputsAsync(agentId);
+        var busy = await consoleManager.CollectBusyStatusesAsync(agentId, excludePid);
 
-        if (closed.Count == 0 && cached.Count == 0)
+        if (closed.Count == 0 && cached.Count == 0 && busy.Count == 0)
             return response;
 
         var sb = new StringBuilder();
@@ -153,7 +156,14 @@ public class ShellTools
             sb.AppendLine();
         }
 
-        // Cached command results
+        // Other consoles still running a previously-started AI command
+        foreach (var b in busy)
+        {
+            sb.AppendLine(FormatBusyLine(b));
+        }
+        if (busy.Count > 0) sb.AppendLine();
+
+        // Cached command results (timed-out AI commands that have since completed)
         foreach (var r in cached)
         {
             sb.AppendLine(FormatStatusLine(r));
@@ -164,5 +174,17 @@ public class ShellTools
 
         sb.Append(response);
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// One-line summary of a background busy console. Shown at the top of
+    /// unrelated tool responses so the AI doesn't forget long-running work.
+    /// </summary>
+    private static string FormatBusyLine(ConsoleManager.BusyStatus b)
+    {
+        var shell = b.ShellFamily != null ? $" ({b.ShellFamily})" : "";
+        var elapsed = b.ElapsedSeconds.HasValue ? $" ({b.ElapsedSeconds.Value:F0}s)" : "";
+        var cmd = string.IsNullOrEmpty(b.RunningCommand) ? "(user command)" : b.RunningCommand;
+        return $"⧗ {b.DisplayName}{shell} | Status: Busy{elapsed} | Pipeline: {cmd}";
     }
 }
