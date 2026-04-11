@@ -321,6 +321,15 @@ public class ConsoleManager
         // know how to translate (bash /mnt/c/... vs pwsh C:\...).
         if (activeBusy && consolePid == initialActivePid)
         {
+            // Remember that this console is running something so the tool
+            // response can include a background-busy line for it. Without
+            // this, `KnownBusyPids` is only populated from AI-command
+            // timeouts, so user-initiated activity like `pause` silently
+            // disappears from the background busy report even though we
+            // just detected and routed away from it. CollectBusyStatuses
+            // will self-heal the entry once the console returns to idle.
+            MarkPipeBusy(agentId, initialActivePid);
+
             consolePid = 0;
             if (resolvedShell == null)
             {
@@ -374,6 +383,36 @@ public class ConsoleManager
 
         if (isSwitching && sourceCwd != null && sameShellFamily)
         {
+            // Before propagating the source's live cwd into the target via
+            // cd preamble, check whether that cwd matches what the AI last
+            // saw on the source. If they differ, the human user has manually
+            // cd'd in the source console since the last AI command and we
+            // should NOT silently inherit that new cwd on behalf of the AI —
+            // warn instead so the AI can verify the target cwd before its
+            // next execute. Update the source's LastAiCwd to the current
+            // live cwd so the retry (with updated expectations) goes through.
+            string? sourceLastAiCwd = null;
+            if (initialActivePid != 0)
+                lock (_lock) sourceLastAiCwd = _consoles.GetValueOrDefault(initialActivePid)?.LastAiCwd;
+
+            if (sourceLastAiCwd != null && !sourceCwd.Equals(sourceLastAiCwd, PathComparison))
+            {
+                lock (_lock)
+                {
+                    var src = _consoles.GetValueOrDefault(initialActivePid);
+                    if (src != null) src.LastAiCwd = sourceCwd;
+                }
+                var targetDisplay = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+                var sourceDisplay = _consoles.GetValueOrDefault(initialActivePid)?.DisplayName ?? $"#{initialActivePid}";
+                return new ExecuteResult
+                {
+                    Pid = consolePid,
+                    Switched = true,
+                    DisplayName = targetDisplay,
+                    Output = $"Switched to console {targetDisplay}. Source console {sourceDisplay} cwd is now '{sourceCwd}' (was '{sourceLastAiCwd}'). Pipeline NOT executed — verify cwd and re-execute.",
+                };
+            }
+
             // Same-shell switch with a known source cwd: prepend cd preamble so
             // the user's command runs in the source cwd. Makes switching transparent.
             var cdPreamble = BuildCdPreamble(targetShellFamily!, sourceCwd);
