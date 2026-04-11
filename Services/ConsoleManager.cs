@@ -404,8 +404,7 @@ public class ConsoleManager
             if (initialActivePid != 0)
                 lock (_lock) sourceLastAiCwd = _consoles.GetValueOrDefault(initialActivePid)?.LastAiCwd;
 
-            bool sourceDrifted = sourceLastAiCwd != null
-                && !sourceCwd.Equals(sourceLastAiCwd, PathComparison);
+            bool sourceDrifted = IsCwdDrifted(sourceLastAiCwd, sourceCwd);
 
             // preambleCwd is what the new console will be cd'd to before
             // the AI command runs. When source has drifted we restore the
@@ -467,8 +466,7 @@ public class ConsoleManager
                 lastAiCwd = consoleInfo?.LastAiCwd;
             }
 
-            if (currentCwd != null && lastAiCwd != null &&
-                !currentCwd.Equals(lastAiCwd, PathComparison))
+            if (IsCwdDrifted(lastAiCwd, currentCwd))
             {
                 lock (_lock) { if (consoleInfo != null) consoleInfo.LastAiCwd = currentCwd; }
                 var displayName = consoleInfo?.DisplayName ?? $"#{consolePid}";
@@ -724,6 +722,20 @@ public class ConsoleManager
 
     private static readonly StringComparison PathComparison =
         OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    /// <summary>
+    /// True when a console's live cwd differs from the cwd the AI last saw
+    /// it complete a command in (its LastAiCwd), i.e. the human user has
+    /// manually cd'd since the last AI command. Null on either side means
+    /// the AI has no prior expectation (fresh console, or no cwd reported
+    /// by the worker) and so nothing has drifted — the routing code treats
+    /// that as "use the live cwd as-is". Uses the same path comparison
+    /// policy (Ordinal on POSIX, OrdinalIgnoreCase on Windows) as every
+    /// other path match in this file.
+    /// </summary>
+    internal static bool IsCwdDrifted(string? lastAiCwd, string? liveCwd)
+        => lastAiCwd != null && liveCwd != null
+           && !liveCwd.Equals(lastAiCwd, PathComparison);
 
     private async Task<(int Pid, string DisplayName)?> TryFindInPipesAsync(IEnumerable<string> pipes, string? shellPath = null)
     {
