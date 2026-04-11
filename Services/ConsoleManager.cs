@@ -381,49 +381,57 @@ public class ConsoleManager
         // sees the pipeline it asked for, not the proxy-injected cd.
         var executedCommand = command;
 
+        // Out-of-band notice attached to the success result, used when we
+        // silently corrected for a user-initiated cwd change in the source
+        // console so the AI sees what splash did on its behalf.
+        string? routingNotice = null;
+
         if (isSwitching && sourceCwd != null && sameShellFamily)
         {
-            // Before propagating the source's live cwd into the target via
-            // cd preamble, check whether that cwd matches what the AI last
-            // saw on the source. If they differ, the human user has manually
-            // cd'd in the source console since the last AI command and we
-            // should NOT silently inherit that new cwd on behalf of the AI —
-            // warn instead so the AI can verify the target cwd before its
-            // next execute. Update the source's LastAiCwd to the current
-            // live cwd so the retry (with updated expectations) goes through.
+            // The AI's "intended cwd" is whatever it last saw a successful
+            // command complete at on the source console — i.e. source's
+            // LastAiCwd. The source's *live* cwd may have drifted from that
+            // if the human user manually cd'd before kicking off the busy
+            // command we're routing around. Honor the AI's intent: when
+            // there's drift, use LastAiCwd as the preamble target instead
+            // of the live cwd so the AI keeps working in the directory it
+            // thinks it's in. The source's LastAiCwd is intentionally NOT
+            // updated, so if the AI later returns to the source console it
+            // will either match (user cd'd back) or trigger the same-console
+            // mismatch warning, which gives the AI the explicit signal it
+            // needs to verify and re-execute.
             string? sourceLastAiCwd = null;
             if (initialActivePid != 0)
                 lock (_lock) sourceLastAiCwd = _consoles.GetValueOrDefault(initialActivePid)?.LastAiCwd;
 
-            if (sourceLastAiCwd != null && !sourceCwd.Equals(sourceLastAiCwd, PathComparison))
-            {
-                lock (_lock)
-                {
-                    var src = _consoles.GetValueOrDefault(initialActivePid);
-                    if (src != null) src.LastAiCwd = sourceCwd;
-                }
-                var targetDisplay = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
-                var sourceDisplay = _consoles.GetValueOrDefault(initialActivePid)?.DisplayName ?? $"#{initialActivePid}";
-                return new ExecuteResult
-                {
-                    Pid = consolePid,
-                    Switched = true,
-                    DisplayName = targetDisplay,
-                    Output = $"Switched to console {targetDisplay}. Source console {sourceDisplay} cwd is now '{sourceCwd}' (was '{sourceLastAiCwd}'). Pipeline NOT executed — verify cwd and re-execute.",
-                };
-            }
+            bool sourceDrifted = sourceLastAiCwd != null
+                && !sourceCwd.Equals(sourceLastAiCwd, PathComparison);
 
-            // Same-shell switch with a known source cwd: prepend cd preamble so
-            // the user's command runs in the source cwd. Makes switching transparent.
-            var cdPreamble = BuildCdPreamble(targetShellFamily!, sourceCwd);
+            // preambleCwd is what the new console will be cd'd to before
+            // the AI command runs. When source has drifted we restore the
+            // AI's last known cwd; otherwise we propagate the live cwd
+            // (which equals LastAiCwd in the no-drift case anyway).
+            var preambleCwd = sourceDrifted ? sourceLastAiCwd! : sourceCwd;
+
+            var cdPreamble = BuildCdPreamble(targetShellFamily!, preambleCwd);
             if (cdPreamble != null)
             {
                 executedCommand = cdPreamble + command;
                 lock (_lock)
                 {
                     var info = _consoles.GetValueOrDefault(consolePid);
-                    if (info != null) info.LastAiCwd = sourceCwd;
+                    if (info != null) info.LastAiCwd = preambleCwd;
                 }
+            }
+
+            if (sourceDrifted)
+            {
+                var sourceDisplay = _consoles.GetValueOrDefault(initialActivePid)?.DisplayName ?? $"#{initialActivePid}";
+                var targetDisplay = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+                routingNotice =
+                    $"Note: source console {sourceDisplay} was moved by user from '{sourceLastAiCwd}' to '{sourceCwd}'. " +
+                    $"Command ran in {targetDisplay} at your last known cwd '{sourceLastAiCwd}'. " +
+                    $"To follow the user's new cwd, include an explicit Set-Location/cd in your command or use absolute paths.";
             }
         }
         else if (isSwitching)
@@ -502,7 +510,7 @@ public class ConsoleManager
                 var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
                 var shellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily;
                 MarkPipeBusy(agentId, consolePid);
-                return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, ShellFamily = shellFamily, Command = command };
+                return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, ShellFamily = shellFamily, Command = command, Notice = routingNotice };
             }
 
             var output = response.TryGetProperty("output", out var outputProp) ? outputProp.GetString() ?? "" : "";
@@ -555,6 +563,7 @@ public class ConsoleManager
                 DisplayName = displayName2,
                 ShellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily,
                 Cwd = cwdResult,
+                Notice = routingNotice,
             };
         }
         catch (TimeoutException)
@@ -562,14 +571,14 @@ public class ConsoleManager
             // Pipe communication timeout (worker didn't respond in time)
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
             MarkPipeBusy(agentId, consolePid);
-            return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, Command = command };
+            return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, Command = command, Notice = routingNotice };
         }
         catch (OperationCanceledException)
         {
             // Pipe CancellationToken fired
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
             MarkPipeBusy(agentId, consolePid);
-            return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, Command = command };
+            return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, Command = command, Notice = routingNotice };
         }
         catch (IOException)
         {
@@ -1024,12 +1033,24 @@ public class ConsoleManager
                 // a finished notification even if nothing else tagged it.
                 if (!wasKnownBusy) MarkPipeBusy(agentId, pid);
 
-                // Prefer the proxy-tracked LastAiCommand (original user input)
-                // over the worker's runningCommand (which includes any cd
-                // preamble the proxy injected before sending). Fall back if
-                // the proxy never recorded one.
-                var cmd = info?.LastAiCommand
-                    ?? (statusResp.TryGetProperty("runningCommand", out var rc) ? rc.GetString() : null);
+                // Decide what command text to show on the busy line. The
+                // worker's runningCommand returns null when its busy state
+                // is from a user-typed command (CommandTracker only fills it
+                // for AI commands), so a null here means "the human typed
+                // this, not the AI" — surface that as "(user command)" by
+                // returning null. The proxy's LastAiCommand is the previous
+                // AI command's text and would otherwise leak across into
+                // a user busy line as a stale label. When the worker IS
+                // running an AI command, prefer LastAiCommand (it's the
+                // clean original without any cd preamble splash injected),
+                // falling back to the worker's text if the proxy never
+                // recorded one.
+                var workerRunning = statusResp.TryGetProperty("runningCommand", out var rc)
+                    ? rc.GetString()
+                    : null;
+                var cmd = workerRunning != null
+                    ? (info?.LastAiCommand ?? workerRunning)
+                    : null;
                 double? elapsed = null;
                 if (statusResp.TryGetProperty("runningElapsedSeconds", out var esProp)
                     && esProp.ValueKind == JsonValueKind.Number)
@@ -1546,5 +1567,9 @@ public class ConsoleManager
         public string? Cwd { get; set; }
         public bool Switched { get; set; }
         public bool TimedOut { get; set; }
+        // Free-form notice prepended to the response. Used to surface
+        // out-of-band events like "the source console you came from has
+        // been moved by the user, your last known cwd has been preserved".
+        public string? Notice { get; set; }
     }
 }

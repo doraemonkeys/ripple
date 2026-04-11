@@ -75,6 +75,13 @@ public class ShellTools
             response = $"{statusLine}\n\n{(string.IsNullOrEmpty(result.Output) ? "(no output)" : result.Output)}";
         }
 
+        // A routing notice (e.g. "source console was moved by user, your
+        // last known cwd was preserved by routing to a different console")
+        // belongs above the status line so the AI sees the context before
+        // reading the command's own output.
+        if (!string.IsNullOrEmpty(result.Notice))
+            response = $"{result.Notice}\n\n{response}";
+
         return await AppendCachedOutputs(consoleManager, agentId, response, excludePid: result.Pid);
     }
 
