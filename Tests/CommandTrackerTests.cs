@@ -333,12 +333,33 @@ public class CommandTrackerTests
                 $"recent: CUU then write — got: {snap}");
         }
 
-        // Test 22: the FIRST OSC A (PromptStart) clears the recent-output
-        // ring to drop pre-shell boot noise and any prior-session residue
-        // left on a reused standby console. Subsequent OSC A events do
-        // NOT clear the ring — peek_console should show the recent
-        // command history the terminal displays, not just the current
-        // prompt. Regression guard for that distinction.
+        // Test: \e[<params>t (DEC window manipulation) is treated as a
+        // full-screen refresh trigger. ConPTY emits this right before
+        // repainting the entire viewport, so VtLite should drop the
+        // current grid and start fresh on the refresh content.
+        {
+            var t = new CommandTracker();
+            // Old stale content, then the window-manip refresh trigger,
+            // then a fresh screen write.
+            t.FeedOutput("stale junk line\x1b[8;25;105tfresh content\nsecond line");
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(!snap.Contains("stale junk"),
+                $"recent: \\e[<...>t clears stale pre-refresh content — got: {snap}");
+            Assert(snap.Contains("fresh content"),
+                $"recent: post-refresh content is captured — got: {snap}");
+            Assert(snap.Contains("second line"),
+                $"recent: post-refresh multi-row content — got: {snap}");
+        }
+
+        // Test 22: the recent-output ring is cleared on (a) the FIRST
+        // OSC A (PromptStart) — drops pre-shell boot noise and any
+        // prior-session residue on a reused standby console — and (b)
+        // every OSC C (CommandExecuted) — drops PSReadLine typing
+        // noise and inline prediction artifacts that are rendered via
+        // terminal-absolute coordinates we can't faithfully reflow.
+        // After OSC C, the ring accumulates only the actual command
+        // output, giving peek_console a clean "what is the current
+        // command doing right now?" view.
         {
             var t = new CommandTracker();
 
@@ -352,19 +373,30 @@ public class CommandTrackerTests
             Assert(t.GetRecentOutputSnapshot() == "",
                 "recent: first OSC A clears the ring");
 
-            // New content fills the now-empty ring.
-            t.FeedOutput("PS C:\\> ");
-            Assert(t.GetRecentOutputSnapshot() == "PS C:\\>",
-                "recent: post-first-reset writes land in an empty ring");
+            // User starts typing — PSReadLine rendering noise flows in.
+            t.FeedOutput("PS > \x1b[?25l\x1b[93mS\x1b[97m\x1b[2met-Location prediction\x1b[?25h");
+            Assert(t.GetRecentOutputSnapshot().Length > 0,
+                "recent: typing noise is in the ring pre-OSC-C");
 
-            // User runs a command — output accumulates.
-            t.FeedOutput("first command output\n");
+            // OSC C fires when the command actually starts running.
+            // Ring must clear to drop the typing noise.
+            t.HandleEvent(new OscParser.OscEvent(OscParser.OscEventType.CommandExecuted));
+            Assert(t.GetRecentOutputSnapshot() == "",
+                "recent: OSC C clears PSReadLine typing noise");
+
+            // Command output accumulates into the fresh ring.
+            t.FeedOutput("actual command output\n");
+            Assert(t.GetRecentOutputSnapshot().Contains("actual command output"),
+                "recent: post-OSC-C output captured cleanly");
+
+            // Command finishes, next prompt fires. The ring is NOT
+            // cleared here — the current command's output stays
+            // visible until the NEXT command starts.
+            t.HandleEvent(new OscParser.OscEvent(OscParser.OscEventType.CommandFinished, ExitCode: 0));
             t.HandleEvent(new OscParser.OscEvent(OscParser.OscEventType.PromptStart));
-            // Second OSC A should NOT clear the ring — the first command's
-            // output must remain visible in the snapshot.
-            var afterSecond = t.GetRecentOutputSnapshot();
-            Assert(afterSecond.Contains("first command output"),
-                $"recent: subsequent OSC A preserves history — got: {afterSecond}");
+            var afterPrompt = t.GetRecentOutputSnapshot();
+            Assert(afterPrompt.Contains("actual command output"),
+                $"recent: OSC A after first cycle preserves output — got: {afterPrompt}");
         }
 
         Console.WriteLine($"\n{pass} passed, {fail} failed");

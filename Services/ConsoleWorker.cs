@@ -1025,6 +1025,13 @@ public class ConsoleWorker
                 if (elapsed.HasValue) w.WriteNumber("runningElapsedSeconds", elapsed.Value);
                 else w.WriteNull("runningElapsedSeconds");
                 w.WriteString("recentOutput", snapshot);
+                var wantRaw = request.TryGetProperty("raw", out var rawProp) && rawProp.ValueKind == JsonValueKind.True;
+                if (wantRaw)
+                {
+                    var raw = _tracker.GetRawRecentBytes();
+                    var rawBytes = Encoding.UTF8.GetBytes(raw);
+                    w.WriteString("rawBase64", Convert.ToBase64String(rawBytes));
+                }
             }),
             "drain_post_output" => await HandleDrainPostOutputAsync(request, ct),
             "set_title" => HandleSetTitle(request),

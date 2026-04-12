@@ -193,6 +193,23 @@ public class CommandTracker
             if (evt.Type == OscParser.OscEventType.Cwd)
                 _lastKnownCwd = evt.Cwd;
 
+            // OSC C (CommandExecuted) is the cleanest boundary to reset the
+            // recent-output ring for peek_console / timeout partialOutput.
+            // Everything before OSC C is PSReadLine typing noise — per-
+            // keystroke re-rendering, inline history prediction, cursor
+            // dancing via absolute CUP — which no amount of VT-lite
+            // interpretation can sanitise perfectly because PSReadLine
+            // uses terminal-absolute coordinates that don't line up with
+            // our ring's start. Clearing on OSC C gives peek a clean
+            // "everything since the current command started running"
+            // view, which is exactly the question execute_command's
+            // timeout asks ("what is this stuck command doing right now?").
+            // The command text itself is still reported via the
+            // runningCommand metadata field, so peek callers never lose
+            // context about what's running.
+            if (evt.Type == OscParser.OscEventType.CommandExecuted)
+                ResetRecentBuffer();
+
             // Mark the shell as "ready" on the first PromptStart. Until then,
             // ignore user-command busy transitions — the initial OSC B that
             // integration scripts emit at startup (and the subsequent prompt
@@ -201,9 +218,7 @@ public class CommandTracker
             // The FIRST PromptStart is also when we clear the recent-output
             // ring: anything before it is pre-shell boot noise (or prior-
             // session residue on a reused standby console) that isn't part
-            // of what the user would see on a fresh terminal. After that
-            // first reset, the ring accumulates naturally so peek_console
-            // shows the recent command history just like the terminal does.
+            // of what the user would see on a fresh terminal.
             if (evt.Type == OscParser.OscEventType.PromptStart && !_shellReady)
                 ResetRecentBuffer();
             if (evt.Type == OscParser.OscEventType.PromptStart)
@@ -335,6 +350,29 @@ public class CommandTracker
     public void ClearRecentOutput()
     {
         lock (_lock) ResetRecentBuffer();
+    }
+
+    /// <summary>
+    /// Diagnostic: return the raw bytes currently in the recent-output
+    /// ring, in the order they were received, without any ANSI or
+    /// VT processing. Used to debug VtLite interpretation issues
+    /// (when peek_console shows content that isn't in the byte
+    /// stream).
+    /// </summary>
+    public string GetRawRecentBytes()
+    {
+        lock (_lock)
+        {
+            if (_recentLen == 0) return "";
+            if (_recentLen < RecentOutputCapacity)
+                return new string(_recentBuf, 0, _recentLen);
+
+            var tmp = new char[RecentOutputCapacity];
+            var firstPart = RecentOutputCapacity - _recentPos;
+            Array.Copy(_recentBuf, _recentPos, tmp, 0, firstPart);
+            Array.Copy(_recentBuf, 0, tmp, firstPart, _recentPos);
+            return new string(tmp);
+        }
     }
 
     private void AppendRecent(string text)
@@ -620,13 +658,23 @@ public class CommandTracker
             case 'K': state.EraseLine(Param(0, 0)); break;        // EL
             case 'J': state.EraseDisplay(Param(0, 0)); break;     // ED
             case 'd': state.Row = Math.Max(0, Param(0, 1) - 1); state.EnsureRow(state.Row); break; // VPA
+            case 't':
+                // DEC / xterm window manipulation — e.g. \e[8;<h>;<w>t to
+                // resize the text area. ConPTY emits this as the prelude
+                // to a full-screen refresh: after the `t` sequence it
+                // repaints the entire viewport starting from \e[H. Treat
+                // it as a full clear so our grid stays in sync with
+                // ConPTY's viewport and doesn't carry stale content
+                // (PSReadLine prediction artifacts, prior command
+                // fragments) forward from before the refresh.
+                state.EraseDisplay(2);
+                break;
             case 'm': // SGR — colors/attrs, no-op
             case 's': // save cursor
             case 'u': // restore cursor
             case 'r': // scroll region
             case 'n': // device status report
             case 'c': // device attributes
-            case 't': // window manipulation
                 break;
             default:
                 // Unknown final byte — drop silently.

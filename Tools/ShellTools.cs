@@ -133,10 +133,12 @@ public class ShellTools
         string? shell = null,
         [Description("Agent ID for sub-agent console isolation.")]
         string? agent_id = null,
+        [Description("Debug: include raw ring buffer bytes as an escaped hex preview. Off by default.")]
+        bool raw = false,
         CancellationToken cancellationToken = default)
     {
         var agentId = agent_id ?? "default";
-        var peek = await consoleManager.PeekConsoleAsync(agentId, shell);
+        var peek = await consoleManager.PeekConsoleAsync(agentId, shell, raw);
         if (peek == null)
             return "No console to peek at. Start one with start_console first.";
 
@@ -161,6 +163,28 @@ public class ShellTools
         sb.AppendLine();
         sb.AppendLine("--- recent output ---");
         sb.Append(string.IsNullOrEmpty(peek.RecentOutput) ? "(empty)" : peek.RecentOutput);
+
+        if (raw && !string.IsNullOrEmpty(peek.RawBase64))
+        {
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("--- raw ring bytes (hex escaped) ---");
+            var rawBytes = Convert.FromBase64String(peek.RawBase64!);
+            var rawText = System.Text.Encoding.UTF8.GetString(rawBytes);
+            var hex = new StringBuilder();
+            foreach (var c in rawText)
+            {
+                if (c == '\x1b') hex.Append("\\e");
+                else if (c == '\r') hex.Append("\\r");
+                else if (c == '\n') hex.Append("\\n");
+                else if (c == '\t') hex.Append("\\t");
+                else if (c == '\a') hex.Append("\\a");
+                else if (c < 0x20) hex.Append($"\\x{(int)c:x2}");
+                else if (c == '\\') hex.Append("\\\\");
+                else hex.Append(c);
+            }
+            sb.Append(hex.ToString());
+        }
         return sb.ToString();
     }
 

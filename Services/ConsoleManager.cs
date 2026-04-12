@@ -1036,7 +1036,8 @@ public class ConsoleManager
         bool Busy,
         string? RunningCommand,
         double? RunningElapsedSeconds,
-        string RecentOutput);
+        string RecentOutput,
+        string? RawBase64 = null);
 
     /// <summary>
     /// Snapshot what a console has been emitting recently via the peek
@@ -1050,7 +1051,7 @@ public class ConsoleManager
     /// active). Otherwise it targets the agent's current active console.
     /// Returns null if there is no suitable console to peek at.
     /// </remarks>
-    public async Task<PeekResult?> PeekConsoleAsync(string agentId, string? shell = null)
+    public async Task<PeekResult?> PeekConsoleAsync(string agentId, string? shell = null, bool raw = false)
     {
         int? pid;
         string? pipeName;
@@ -1085,7 +1086,7 @@ public class ConsoleManager
         try
         {
             var resp = await SendPipeRequestAsync(pipeName,
-                w => w.WriteString("type", "peek"),
+                w => { w.WriteString("type", "peek"); if (raw) w.WriteBoolean("raw", true); },
                 TimeSpan.FromSeconds(3));
 
             var status = resp.TryGetProperty("status", out var stProp) ? stProp.GetString() ?? "" : "";
@@ -1095,8 +1096,9 @@ public class ConsoleManager
             if (resp.TryGetProperty("runningElapsedSeconds", out var esProp) && esProp.ValueKind == JsonValueKind.Number)
                 elapsed = esProp.GetDouble();
             var recent = resp.TryGetProperty("recentOutput", out var roProp) ? roProp.GetString() ?? "" : "";
+            var rawB64 = resp.TryGetProperty("rawBase64", out var rbProp) ? rbProp.GetString() : null;
 
-            return new PeekResult(pid.Value, displayName!, shellFamily, status, busy, runningCmd, elapsed, recent);
+            return new PeekResult(pid.Value, displayName!, shellFamily, status, busy, runningCmd, elapsed, recent, rawB64);
         }
         catch
         {
