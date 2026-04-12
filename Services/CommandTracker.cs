@@ -90,6 +90,16 @@ public class CommandTracker
     private string? _lastKnownCwd;
     public string? LastKnownCwd { get { lock (_lock) return _lastKnownCwd; } }
 
+    // Terminal dimensions for VT-medium viewport. Set by ConsoleWorker
+    // at PTY creation and on each resize.
+    private int _terminalCols = 120;
+    private int _terminalRows = 30;
+
+    public void SetTerminalSize(int cols, int rows)
+    {
+        lock (_lock) { _terminalCols = cols; _terminalRows = rows; }
+    }
+
     public bool Busy => _isAiCommand || _userCommandBusy;
     public bool HasCachedOutput => _cachedResult != null;
 
@@ -426,7 +436,9 @@ public class CommandTracker
                 raw = new string(tmp);
             }
         }
-        return VtLite(raw);
+        int cols, rows;
+        lock (_lock) { cols = _terminalCols; rows = _terminalRows; }
+        return VtLite(raw, rows, cols);
     }
 
     /// <summary>
@@ -445,9 +457,9 @@ public class CommandTracker
     /// single-row model collapsed onto the prior command's row and left
     /// stale tail bytes in place.
     /// </summary>
-    private static string VtLite(string input)
+    private static string VtLite(string input, int viewRows = 30, int viewCols = 120)
     {
-        var state = new VtState();
+        var state = new VtState(viewRows, viewCols);
         int i = 0;
         while (i < input.Length)
         {
@@ -464,77 +476,201 @@ public class CommandTracker
     }
 
     /// <summary>
-    /// Virtual screen state for VtLite. Rows grow on demand; there is no
-    /// fixed viewport height, so CUP addresses into rows[0..] directly.
-    /// MaxRow tracks the highest row index written so the final render
-    /// can trim trailing empty rows.
+    /// Fixed-viewport VT terminal state (VT-medium). Maintains a cell
+    /// grid of viewRows × viewCols with proper:
+    ///   - Soft line wrap at the right margin
+    ///   - Vertical scrolling when cursor passes the bottom of the
+    ///     scroll region (old lines scroll off the top)
+    ///   - Scroll region (DECSTBM \e[top;bottom r)
+    ///   - Alternate screen buffer (\e[?1049h/l)
+    ///   - Save / restore cursor (\e7 / \e8, \e[s / \e[u)
+    /// This is the Linux/macOS fallback when ReadConsoleOutputCharacter
+    /// is unavailable. On Windows the native API is preferred, but this
+    /// code still runs for the unit tests and as a safety net.
     /// </summary>
     private sealed class VtState
     {
-        public readonly List<StringBuilder> Rows = new() { new StringBuilder() };
-        public int Row;
-        public int Col;
-        public int MaxRow;
+        public readonly int ViewRows;
+        public readonly int ViewCols;
 
-        public void EnsureRow(int r)
+        // Primary and alternate screen buffers.
+        private readonly char[][] _primary;
+        private readonly char[][] _alternate;
+        private bool _useAlternate;
+
+        // Cursor position per buffer.
+        private int _pRow, _pCol;   // primary
+        private int _aRow, _aCol;   // alternate
+
+        // Saved cursor (DEC save/restore).
+        private int _savedRow, _savedCol;
+
+        // Scroll region (0-indexed, inclusive on both ends).
+        private int _scrollTop;
+        private int _scrollBottom;
+
+        // Active grid / cursor accessors.
+        private char[][] Grid => _useAlternate ? _alternate : _primary;
+        public int Row
         {
-            while (Rows.Count <= r) Rows.Add(new StringBuilder());
-            if (r > MaxRow) MaxRow = r;
+            get => _useAlternate ? _aRow : _pRow;
+            set { if (_useAlternate) _aRow = value; else _pRow = value; }
+        }
+        public int Col
+        {
+            get => _useAlternate ? _aCol : _pCol;
+            set { if (_useAlternate) _aCol = value; else _pCol = value; }
+        }
+
+        public VtState(int rows, int cols)
+        {
+            ViewRows = Math.Max(1, rows);
+            ViewCols = Math.Max(1, cols);
+            _primary = CreateGrid(ViewRows, ViewCols);
+            _alternate = CreateGrid(ViewRows, ViewCols);
+            _scrollTop = 0;
+            _scrollBottom = ViewRows - 1;
+        }
+
+        private static char[][] CreateGrid(int rows, int cols)
+        {
+            var grid = new char[rows][];
+            for (int i = 0; i < rows; i++)
+            {
+                grid[i] = new char[cols];
+                Array.Fill(grid[i], ' ');
+            }
+            return grid;
         }
 
         public void WriteChar(char c)
         {
-            EnsureRow(Row);
-            var row = Rows[Row];
-            if (Col < row.Length) row[Col] = c;
-            else
+            // Auto-wrap at right margin.
+            if (Col >= ViewCols)
             {
-                while (row.Length < Col) row.Append(' ');
-                row.Append(c);
+                Col = 0;
+                if (Row == _scrollBottom)
+                    ScrollUp(1);
+                else if (Row < ViewRows - 1)
+                    Row++;
             }
+            Grid[Row][Col] = c;
             Col++;
         }
 
         public void LineFeed()
         {
-            Row++;
-            Col = 0;
-            EnsureRow(Row);
+            if (Row == _scrollBottom)
+                ScrollUp(1);
+            else if (Row < ViewRows - 1)
+                Row++;
+        }
+
+        public void ReverseIndex()
+        {
+            if (Row == _scrollTop)
+                ScrollDown(1);
+            else if (Row > 0)
+                Row--;
+        }
+
+        private void ScrollUp(int n)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var top = Grid[_scrollTop];
+                for (int r = _scrollTop; r < _scrollBottom; r++)
+                    Grid[r] = Grid[r + 1];
+                Array.Fill(top, ' ');
+                Grid[_scrollBottom] = top;
+            }
+        }
+
+        private void ScrollDown(int n)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var bot = Grid[_scrollBottom];
+                for (int r = _scrollBottom; r > _scrollTop; r--)
+                    Grid[r] = Grid[r - 1];
+                Array.Fill(bot, ' ');
+                Grid[_scrollTop] = bot;
+            }
         }
 
         public void CarriageReturn() { Col = 0; }
         public void Backspace() { if (Col > 0) Col--; }
-        public void Tab() { Col = ((Col / 8) + 1) * 8; }
+        public void Tab() { Col = Math.Min(((Col / 8) + 1) * 8, ViewCols - 1); }
 
         public void CursorUp(int n) { Row = Math.Max(0, Row - Math.Max(1, n)); }
-        public void CursorDown(int n) { Row += Math.Max(1, n); EnsureRow(Row); }
-        public void CursorForward(int n) { Col += Math.Max(1, n); }
+        public void CursorDown(int n) { Row = Math.Min(ViewRows - 1, Row + Math.Max(1, n)); }
+        public void CursorForward(int n) { Col = Math.Min(ViewCols - 1, Col + Math.Max(1, n)); }
         public void CursorBack(int n) { Col = Math.Max(0, Col - Math.Max(1, n)); }
-        public void CursorCol(int c1) { Col = Math.Max(0, c1 - 1); }
+        public void CursorCol(int c1) { Col = Math.Clamp(c1 - 1, 0, ViewCols - 1); }
 
         public void CursorPos(int r1, int c1)
         {
-            Row = Math.Max(0, r1 - 1);
-            Col = Math.Max(0, c1 - 1);
-            EnsureRow(Row);
+            Row = Math.Clamp(r1 - 1, 0, ViewRows - 1);
+            Col = Math.Clamp(c1 - 1, 0, ViewCols - 1);
+        }
+
+        public void SaveCursor() { _savedRow = Row; _savedCol = Col; }
+        public void RestoreCursor() { Row = _savedRow; Col = _savedCol; }
+
+        public void SetScrollRegion(int top1, int bottom1)
+        {
+            _scrollTop = Math.Clamp(top1 - 1, 0, ViewRows - 1);
+            _scrollBottom = Math.Clamp(bottom1 - 1, 0, ViewRows - 1);
+            if (_scrollTop > _scrollBottom)
+            {
+                _scrollTop = 0;
+                _scrollBottom = ViewRows - 1;
+            }
+            // DECSTBM resets cursor to home.
+            Row = 0;
+            Col = 0;
+        }
+
+        public void SwitchToAlternate()
+        {
+            if (_useAlternate) return;
+            SaveCursor();
+            _useAlternate = true;
+            ClearGrid(_alternate);
+            _aRow = 0;
+            _aCol = 0;
+            _scrollTop = 0;
+            _scrollBottom = ViewRows - 1;
+        }
+
+        public void SwitchToPrimary()
+        {
+            if (!_useAlternate) return;
+            _useAlternate = false;
+            _scrollTop = 0;
+            _scrollBottom = ViewRows - 1;
+            RestoreCursor();
+        }
+
+        private static void ClearGrid(char[][] grid)
+        {
+            for (int r = 0; r < grid.Length; r++) Array.Fill(grid[r], ' ');
         }
 
         public void EraseLine(int mode)
         {
-            EnsureRow(Row);
-            var row = Rows[Row];
-            if (mode == 0)
+            var row = Grid[Row];
+            if (mode == 0) // cursor to end
             {
-                if (Col < row.Length) row.Length = Col;
+                for (int c = Col; c < ViewCols; c++) row[c] = ' ';
             }
-            else if (mode == 1)
+            else if (mode == 1) // start to cursor
             {
-                int end = Math.Min(Col + 1, row.Length);
-                for (int k = 0; k < end; k++) row[k] = ' ';
+                for (int c = 0; c <= Math.Min(Col, ViewCols - 1); c++) row[c] = ' ';
             }
-            else if (mode == 2)
+            else if (mode == 2) // whole line
             {
-                row.Clear();
+                Array.Fill(row, ' ');
             }
         }
 
@@ -542,37 +678,44 @@ public class CommandTracker
         {
             if (mode == 0)
             {
-                EnsureRow(Row);
-                var row = Rows[Row];
-                if (Col < row.Length) row.Length = Col;
-                for (int r = Row + 1; r < Rows.Count; r++) Rows[r].Clear();
+                EraseLine(0);
+                for (int r = Row + 1; r < ViewRows; r++) Array.Fill(Grid[r], ' ');
             }
             else if (mode == 1)
             {
-                for (int r = 0; r < Row && r < Rows.Count; r++) Rows[r].Clear();
-                EnsureRow(Row);
-                var row = Rows[Row];
-                int end = Math.Min(Col + 1, row.Length);
-                for (int k = 0; k < end; k++) row[k] = ' ';
+                for (int r = 0; r < Row; r++) Array.Fill(Grid[r], ' ');
+                EraseLine(1);
             }
             else if (mode == 2)
             {
-                foreach (var r in Rows) r.Clear();
+                ClearGrid(Grid);
                 Row = 0;
                 Col = 0;
-                MaxRow = 0;
             }
         }
 
         public string Render()
         {
-            int endRow = MaxRow;
-            while (endRow > 0 && Rows[endRow].Length == 0) endRow--;
+            // Find last non-blank row.
+            int lastNonBlank = -1;
+            for (int r = ViewRows - 1; r >= 0; r--)
+            {
+                for (int c = 0; c < ViewCols; c++)
+                {
+                    if (Grid[r][c] != ' ') { lastNonBlank = r; goto done; }
+                }
+            }
+            done:
+            if (lastNonBlank < 0) return "";
+
             var sb = new StringBuilder();
-            for (int r = 0; r <= endRow; r++)
+            for (int r = 0; r <= lastNonBlank; r++)
             {
                 if (r > 0) sb.Append('\n');
-                sb.Append(Rows[r].ToString().TrimEnd());
+                // Trim trailing spaces per row.
+                int end = ViewCols - 1;
+                while (end >= 0 && Grid[r][end] == ' ') end--;
+                if (end >= 0) sb.Append(new string(Grid[r], 0, end + 1));
             }
             return sb.ToString();
         }
@@ -620,14 +763,27 @@ public class CommandTracker
             // Character set selection — \e(<char>
             return Math.Min(i + 2, input.Length);
         }
-        // Single-char ESC — skip it and the follower.
+        if (next == '7') { state.SaveCursor(); return i + 1; }
+        if (next == '8') { state.RestoreCursor(); return i + 1; }
+        if (next == 'M') { state.ReverseIndex(); return i + 1; }
+        // Other single-char ESC — skip the follower.
         return Math.Min(i + 1, input.Length);
     }
 
     private static void ApplyCsi(string paramsStr, char final, VtState state)
     {
-        // Private-mode sequences (DEC — \e[?25h etc.) — ignore entirely.
-        if (paramsStr.Length > 0 && paramsStr[0] == '?') return;
+        // Private-mode sequences (DEC — \e[?...h / \e[?...l).
+        if (paramsStr.Length > 0 && paramsStr[0] == '?')
+        {
+            // Only handle alternate screen buffer toggle.
+            var modeStr = paramsStr.Substring(1);
+            if (modeStr == "1049" || modeStr == "1047" || modeStr == "47")
+            {
+                if (final == 'h') state.SwitchToAlternate();
+                else if (final == 'l') state.SwitchToPrimary();
+            }
+            return;
+        }
 
         // Parse semicolon-separated numeric params. Empty == default.
         string[] parts;
@@ -657,7 +813,7 @@ public class CommandTracker
                 break;
             case 'K': state.EraseLine(Param(0, 0)); break;        // EL
             case 'J': state.EraseDisplay(Param(0, 0)); break;     // ED
-            case 'd': state.Row = Math.Max(0, Param(0, 1) - 1); state.EnsureRow(state.Row); break; // VPA
+            case 'd': state.Row = Math.Clamp(Param(0, 1) - 1, 0, state.ViewRows - 1); break; // VPA
             case 't':
                 // DEC / xterm window manipulation — e.g. \e[8;<h>;<w>t to
                 // resize the text area. ConPTY emits this as the prelude
@@ -669,10 +825,12 @@ public class CommandTracker
                 // fragments) forward from before the refresh.
                 state.EraseDisplay(2);
                 break;
+            case 's': state.SaveCursor(); break;
+            case 'u': state.RestoreCursor(); break;
+            case 'r': // DECSTBM — scroll region
+                state.SetScrollRegion(Param(0, 1), Param(1, state.ViewRows));
+                break;
             case 'm': // SGR — colors/attrs, no-op
-            case 's': // save cursor
-            case 'u': // restore cursor
-            case 'r': // scroll region
             case 'n': // device status report
             case 'c': // device attributes
                 break;

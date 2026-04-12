@@ -308,14 +308,11 @@ public class CommandTrackerTests
 
         // Test 20: CUP to an existing row overwrites from col 1
         // without touching unrelated cells past the new content.
-        // This is the scenario where previously the stale tail
-        // survived a shorter overwrite.
+        // Uses \r\n (CRLF) matching real PTY output — bare \n
+        // only moves down without resetting col per VT spec.
         {
             var t = new CommandTracker();
-            // Row 1: long command
-            // \n → row 2
-            // CUP(1,1) back to row 1, write shorter content + EL to clear tail.
-            t.FeedOutput("aaaaaaaaaaaa\nrow2\x1b[1;1Hbbb\x1b[K");
+            t.FeedOutput("aaaaaaaaaaaa\r\nrow2\x1b[1;1Hbbb\x1b[K");
             var snap = t.GetRecentOutputSnapshot();
             Assert(snap == "bbb\nrow2",
                 $"recent: CUP(1,1) + shorter write + EL clears tail — got: {snap}");
@@ -325,9 +322,10 @@ public class CommandTrackerTests
         // row so subsequent writes land on that row.
         {
             var t = new CommandTracker();
-            t.FeedOutput("row1\nrow2\nrow3\x1b[2AX");
-            // 3 rows, then CUU 2 → row 0, col 4 (unchanged), write 'X'
-            // row 0 = "row1X" (writing at col 4 which is 4 == length → append)
+            t.FeedOutput("row1\r\nrow2\r\nrow3\x1b[2AX");
+            // 3 rows written via CRLF. After "row3", Col=4.
+            // CUU 2 → Row goes from 2 to 0, Col stays at 4.
+            // Write 'X' at row 0 col 4 → "row1X".
             var snap = t.GetRecentOutputSnapshot();
             Assert(snap == "row1X\nrow2\nrow3",
                 $"recent: CUU then write — got: {snap}");

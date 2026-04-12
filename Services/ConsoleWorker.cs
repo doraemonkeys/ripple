@@ -150,6 +150,7 @@ public class ConsoleWorker
         int cols = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
         int rows = Console.WindowHeight > 0 ? Console.WindowHeight : 30;
         _pty = PtyFactory.Start(commandLine, _cwd, cols, rows, inheritEnvironment: inheritEnv);
+        _tracker.SetTerminalSize(cols, rows);
         _writer = _pty.InputStream;
 
         // Start reading PTY output on dedicated thread (feeds OscParser + CommandTracker)
@@ -686,6 +687,7 @@ public class ConsoleWorker
                     lastCols = cols;
                     lastRows = rows;
                     _pty?.Resize(cols, rows);
+                    _tracker.SetTerminalSize(cols, rows);
                     Log($"Resized PTY to {cols}x{rows}");
                 }
             }
