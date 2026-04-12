@@ -1028,6 +1028,39 @@ public class ConsoleManager
         catch { return null; }
     }
 
+    /// <summary>
+    /// Resolve a user-supplied console selector (from peek_console /
+    /// diagnostic tools) to a console PID. The selector matches in
+    /// this order:
+    ///   1. An exact PID number.
+    ///   2. An exact display name ("#43060 Reggae").
+    ///   3. A case-insensitive substring of the display name
+    ///      ("Reggae", "reggae", "43060").
+    /// Returns null if nothing matches, or if the match is ambiguous
+    /// across multiple consoles. Caller must hold _lock.
+    /// </summary>
+    private int? ResolveConsoleSelector(string selector)
+    {
+        // Numeric → PID
+        if (int.TryParse(selector, out var pid) && _consoles.ContainsKey(pid))
+            return pid;
+
+        // Exact display-name match
+        foreach (var kv in _consoles)
+        {
+            if (string.Equals(kv.Value.DisplayName, selector, StringComparison.OrdinalIgnoreCase))
+                return kv.Key;
+        }
+
+        // Substring match
+        var matches = _consoles
+            .Where(kv => kv.Value.DisplayName.Contains(selector, StringComparison.OrdinalIgnoreCase))
+            .Select(kv => (int?)kv.Key)
+            .ToList();
+
+        return matches.Count == 1 ? matches[0] : null;
+    }
+
     public record PeekResult(
         int Pid,
         string DisplayName,
@@ -1046,12 +1079,24 @@ public class ConsoleManager
     /// interrupting it or waiting for completion.
     /// </summary>
     /// <remarks>
-    /// If <paramref name="shell"/> is specified, peek targets the
-    /// active console of that shell family (or a standby if none is
-    /// active). Otherwise it targets the agent's current active console.
-    /// Returns null if there is no suitable console to peek at.
+    /// <para>
+    /// <paramref name="console"/> selects which console to peek at.
+    /// If it's a number, it's matched against console PIDs. Otherwise
+    /// it's matched (case-insensitive, contains-style) against display
+    /// names like "#43060 Reggae". When omitted, the agent's current
+    /// active console is used.
+    /// </para>
+    /// <para>
+    /// Works regardless of whether the target is idle or busy — the
+    /// worker's peek pipe handler is never blocked by the tracker's
+    /// busy state, so this is specifically the right tool for
+    /// observing a long-running command's progress.
+    /// </para>
+    /// <para>
+    /// Returns null if no console matches.
+    /// </para>
     /// </remarks>
-    public async Task<PeekResult?> PeekConsoleAsync(string agentId, string? shell = null, bool raw = false)
+    public async Task<PeekResult?> PeekConsoleAsync(string agentId, string? console = null, bool raw = false)
     {
         int? pid;
         string? pipeName;
@@ -1061,18 +1106,13 @@ public class ConsoleManager
         lock (_lock)
         {
             var state = GetOrCreateAgentState(agentId);
-            if (shell != null)
+            if (string.IsNullOrWhiteSpace(console))
             {
-                var targetFamily = NormalizeShellFamily(shell);
-                var match = _consoles
-                    .Where(kv => kv.Value.ShellFamily == targetFamily)
-                    .Select(kv => (int?)kv.Key)
-                    .FirstOrDefault();
-                pid = match;
+                pid = state.ActivePid != 0 ? state.ActivePid : (int?)null;
             }
             else
             {
-                pid = state.ActivePid != 0 ? state.ActivePid : (int?)null;
+                pid = ResolveConsoleSelector(console);
             }
 
             if (pid == null || !_consoles.TryGetValue(pid.Value, out var info))

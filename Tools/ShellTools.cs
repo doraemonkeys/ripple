@@ -126,11 +126,11 @@ public class ShellTools
     }
 
     [McpServerTool]
-    [Description("Snapshot what a console has been printing recently — the rolling window of output from both AI commands and user-typed commands. Use this when a previous execute_command timed out to see whether the command is in watch mode, stuck at an interactive prompt, or actively progressing; when a standby console unexpectedly reports busy so you can see what the human is doing; or just to verify state before the next action. Read-only — does not interrupt or change anything. Returns the last few KB of output (ANSI-stripped), plus current busy / running-command / elapsed metadata.")]
+    [Description("Snapshot what a console has been printing recently — the output from the currently running command (since it started executing), plus the next prompt once it finishes. Use this to: check a busy console's progress without waiting for wait_for_completion (the peek pipe works during a running command); diagnose a timed-out execute_command (watch mode, interactive prompt, stalled progress); look in on a console that's busy with a user-typed command the AI can see is blocked. Read-only — does not interrupt or change anything. Returns the live rolling window (ANSI-stripped) plus busy / running-command / elapsed metadata. Works on any console — if you need to observe one other than your active one, pass its display name or PID in `console`.")]
     public static async Task<string> PeekConsole(
         ConsoleManager consoleManager,
-        [Description("Shell family to peek at (bash, pwsh, zsh). If omitted, peeks at your current active console.")]
-        string? shell = null,
+        [Description("Which console to peek at. Accepts a PID number or a display-name substring (e.g. \"Reggae\" matches \"#43060 Reggae\"). Omit to peek at your current active console. Crucial when you need to observe a different console than the one you'd normally send commands to — for example, a console that just returned busy for execute_command.")]
+        string? console = null,
         [Description("Agent ID for sub-agent console isolation.")]
         string? agent_id = null,
         [Description("Debug: include raw ring buffer bytes as an escaped hex preview. Off by default.")]
@@ -138,9 +138,13 @@ public class ShellTools
         CancellationToken cancellationToken = default)
     {
         var agentId = agent_id ?? "default";
-        var peek = await consoleManager.PeekConsoleAsync(agentId, shell, raw);
+        var peek = await consoleManager.PeekConsoleAsync(agentId, console, raw);
         if (peek == null)
+        {
+            if (!string.IsNullOrEmpty(console))
+                return $"No console matches \"{console}\". Use the display name (e.g. \"Reggae\") or PID shown in previous tool responses.";
             return "No console to peek at. Start one with start_console first.";
+        }
 
         var shellInfo = peek.ShellFamily != null ? $" ({peek.ShellFamily})" : "";
         var busyMark = peek.Busy ? "⧗ Busy" : "✓ Idle";
