@@ -171,6 +171,202 @@ public class CommandTrackerTests
             Assert(result.Cwd == "C:\\MyProj\\splashshell", "post-command cwd is reported");
         }
 
+        // Test 9: recent-output ring buffer captures output from AI commands,
+        // user commands, and pre-prompt boot noise alike — regardless of
+        // whether an AI command is registered. peek_console / timeout
+        // partialOutput depend on this "always on" behaviour.
+        {
+            var t = new CommandTracker();
+            Assert(t.GetRecentOutputSnapshot() == "", "recent: empty on fresh tracker");
+
+            // Pre-prompt boot bytes — no AI command active yet.
+            t.FeedOutput("boot banner\n");
+            Assert(t.GetRecentOutputSnapshot().Contains("boot banner"), "recent: pre-prompt output captured");
+
+            PrimeShellReady(t);
+            t.FeedOutput("user typed output\n");
+            Assert(t.GetRecentOutputSnapshot().Contains("user typed output"), "recent: user output captured");
+
+            // AI command: real command output flows through too.
+            _ = t.RegisterCommand("Get-Date", timeoutMs: 30_000);
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            t.FeedOutput("ai command output\n");
+            var snapshot = t.GetRecentOutputSnapshot();
+            Assert(snapshot.Contains("ai command output"), "recent: AI output captured");
+        }
+
+        // Test 10: ring buffer wraps correctly when output exceeds capacity.
+        // A 4 KB write followed by a marker tail should show only the
+        // marker plus the tail of the prior content, never the head.
+        {
+            var t = new CommandTracker();
+            var big = new string('x', 5000);
+            t.FeedOutput(big);
+            t.FeedOutput("<<TAIL>>");
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(snap.EndsWith("<<TAIL>>"), "recent: tail marker is at the end after wrap");
+            Assert(snap.Length <= 4096, "recent: snapshot bounded by ring capacity");
+            Assert(!snap.Contains("<<HEAD>>"), "recent: head is not present");
+        }
+
+        // Test 11: GetRecentOutputSnapshot strips ANSI but preserves CRLF
+        // normalisation (matches AI command output cleaning).
+        {
+            var t = new CommandTracker();
+            t.FeedOutput("line1\r\n\x1b[2Kline2\r\n");
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(!snap.Contains('\r'), "recent: CR stripped");
+            Assert(!snap.Contains('\x1b'), "recent: ANSI stripped");
+            Assert(snap.Contains("line1\nline2"), "recent: LF-joined content preserved");
+        }
+
+        // Test 12: CR-overwrite collapse — PSReadLine's typing animation
+        // and progress bars use bare \r to redraw in place. The snapshot
+        // must show only the final state of each line, not the historical
+        // concatenation of every intermediate redraw.
+        {
+            var t = new CommandTracker();
+            // Simulate a progress bar updating in place, then a real line.
+            t.FeedOutput("Progress 10%\rProgress 50%\rProgress 100%\ndone\n");
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(!snap.Contains("Progress 10%"), "recent: earlier progress state dropped");
+            Assert(!snap.Contains("Progress 50%"), "recent: intermediate progress state dropped");
+            Assert(snap.Contains("Progress 100%"), "recent: final progress state kept");
+            Assert(snap.Contains("done"), "recent: following line kept");
+        }
+
+        // Test 13: CRLF is preserved — CR collapse must not eat the prior
+        // line when it ends with CRLF (regression guard).
+        {
+            var t = new CommandTracker();
+            t.FeedOutput("first\r\nsecond\r\n");
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(snap.Contains("first"), "recent: CRLF prior line preserved");
+            Assert(snap.Contains("second"), "recent: CRLF second line preserved");
+        }
+
+        // Test 14: PSReadLine-style in-place redraw using CSI cursor
+        // positioning rather than \r. CHA (\e[G) rewinds to column 1,
+        // EL (\e[K) erases to end of line. The final state should
+        // collapse to just the last rewrite, not the accumulated history.
+        {
+            var t = new CommandTracker();
+            t.FeedOutput("PS> abc\x1b[G\x1b[KPS> abcdef\x1b[G\x1b[KPS> final");
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(snap == "PS> final", $"recent: CSI redraws collapse to final — got: {snap}");
+        }
+
+        // Test 15: CUP (\e[<row>;<col>H) positioning is collapsed into
+        // column-only movement so in-place row rewrites still work.
+        {
+            var t = new CommandTracker();
+            t.FeedOutput("first line\x1b[1;1Hoverwritten");
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(snap == "overwritten", $"recent: CUP to col 1 overwrites — got: {snap}");
+        }
+
+        // Test 16: SGR sequences are dropped cleanly (no leftover bytes).
+        {
+            var t = new CommandTracker();
+            t.FeedOutput("\x1b[31mred\x1b[0m text");
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(snap == "red text", $"recent: SGR dropped — got: {snap}");
+        }
+
+        // Test 17: OSC sequences terminated by BEL or ST are dropped.
+        // Use \a (0x07) instead of \x07 — \x hex escapes are greedy and
+        // would gobble the following 'a' as part of the hex literal.
+        {
+            var t = new CommandTracker();
+            t.FeedOutput("before\x1b]0;window title\aafter");
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(snap == "beforeafter", $"recent: OSC BEL dropped — got: {snap}");
+        }
+
+        // Test 18: cursor back (\e[D) and forward (\e[C) adjust the
+        // write position on the current line.
+        {
+            var t = new CommandTracker();
+            t.FeedOutput("abcdef\x1b[3DXY");
+            // start: "abcdef" col=6, \e[3D → col=3, write "X" at 3 → "abcXef" col=4, write "Y" at 4 → "abcXYf" col=5
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(snap == "abcXYf", $"recent: cursor back then write — got: {snap}");
+        }
+
+        // Test 19: multi-row CUP addresses absolute rows. A new row's
+        // contents must NOT bleed into a previous row. Regression for
+        // the ConPTY "stale tail" bug where CUP(2,1) to start a new
+        // command line was collapsed onto row 1 and left trailing
+        // chars from the previous command.
+        {
+            var t = new CommandTracker();
+            t.FeedOutput("long first row content\x1b[2;1Hshort");
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(snap == "long first row content\nshort",
+                $"recent: CUP(2,1) writes to row 2, row 1 preserved — got: {snap}");
+        }
+
+        // Test 20: CUP to an existing row overwrites from col 1
+        // without touching unrelated cells past the new content.
+        // This is the scenario where previously the stale tail
+        // survived a shorter overwrite.
+        {
+            var t = new CommandTracker();
+            // Row 1: long command
+            // \n → row 2
+            // CUP(1,1) back to row 1, write shorter content + EL to clear tail.
+            t.FeedOutput("aaaaaaaaaaaa\nrow2\x1b[1;1Hbbb\x1b[K");
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(snap == "bbb\nrow2",
+                $"recent: CUP(1,1) + shorter write + EL clears tail — got: {snap}");
+        }
+
+        // Test 21: CUU (cursor up) moves the cursor to the previous
+        // row so subsequent writes land on that row.
+        {
+            var t = new CommandTracker();
+            t.FeedOutput("row1\nrow2\nrow3\x1b[2AX");
+            // 3 rows, then CUU 2 → row 0, col 4 (unchanged), write 'X'
+            // row 0 = "row1X" (writing at col 4 which is 4 == length → append)
+            var snap = t.GetRecentOutputSnapshot();
+            Assert(snap == "row1X\nrow2\nrow3",
+                $"recent: CUU then write — got: {snap}");
+        }
+
+        // Test 22: the FIRST OSC A (PromptStart) clears the recent-output
+        // ring to drop pre-shell boot noise and any prior-session residue
+        // left on a reused standby console. Subsequent OSC A events do
+        // NOT clear the ring — peek_console should show the recent
+        // command history the terminal displays, not just the current
+        // prompt. Regression guard for that distinction.
+        {
+            var t = new CommandTracker();
+
+            // Stale residue from a prior shell session (reused standby).
+            t.FeedOutput("stale output from a previous session\n");
+            Assert(t.GetRecentOutputSnapshot().Contains("stale output"),
+                "recent: stale residue present before first PromptStart");
+
+            // First OSC A = shell is ready. Ring gets wiped.
+            t.HandleEvent(new OscParser.OscEvent(OscParser.OscEventType.PromptStart));
+            Assert(t.GetRecentOutputSnapshot() == "",
+                "recent: first OSC A clears the ring");
+
+            // New content fills the now-empty ring.
+            t.FeedOutput("PS C:\\> ");
+            Assert(t.GetRecentOutputSnapshot() == "PS C:\\>",
+                "recent: post-first-reset writes land in an empty ring");
+
+            // User runs a command — output accumulates.
+            t.FeedOutput("first command output\n");
+            t.HandleEvent(new OscParser.OscEvent(OscParser.OscEventType.PromptStart));
+            // Second OSC A should NOT clear the ring — the first command's
+            // output must remain visible in the snapshot.
+            var afterSecond = t.GetRecentOutputSnapshot();
+            Assert(afterSecond.Contains("first command output"),
+                $"recent: subsequent OSC A preserves history — got: {afterSecond}");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }

@@ -65,7 +65,11 @@ public class ShellTools
         if (result.TimedOut)
         {
             var shellInfo = result.ShellFamily != null ? $" ({result.ShellFamily})" : "";
-            response = $"⧗ {result.DisplayName}{shellInfo} | Status: Busy | Pipeline: {result.Command}\nUse wait_for_completion tool to wait and retrieve the result.";
+            var header = $"⧗ {result.DisplayName}{shellInfo} | Status: Busy | Pipeline: {result.Command}\nUse wait_for_completion tool to wait and retrieve the result.";
+            if (!string.IsNullOrEmpty(result.PartialOutput))
+                response = $"{header}\n\n--- partial output (recent window, not the final result) ---\n{result.PartialOutput}";
+            else
+                response = header;
         }
         else if (result.Switched)
             response = result.Output ?? "";
@@ -119,6 +123,45 @@ public class ShellTools
         }
 
         return await AppendCachedOutputs(consoleManager, agentId, sb.ToString().TrimEnd());
+    }
+
+    [McpServerTool]
+    [Description("Snapshot what a console has been printing recently — the rolling window of output from both AI commands and user-typed commands. Use this when a previous execute_command timed out to see whether the command is in watch mode, stuck at an interactive prompt, or actively progressing; when a standby console unexpectedly reports busy so you can see what the human is doing; or just to verify state before the next action. Read-only — does not interrupt or change anything. Returns the last few KB of output (ANSI-stripped), plus current busy / running-command / elapsed metadata.")]
+    public static async Task<string> PeekConsole(
+        ConsoleManager consoleManager,
+        [Description("Shell family to peek at (bash, pwsh, zsh). If omitted, peeks at your current active console.")]
+        string? shell = null,
+        [Description("Agent ID for sub-agent console isolation.")]
+        string? agent_id = null,
+        CancellationToken cancellationToken = default)
+    {
+        var agentId = agent_id ?? "default";
+        var peek = await consoleManager.PeekConsoleAsync(agentId, shell);
+        if (peek == null)
+            return "No console to peek at. Start one with start_console first.";
+
+        var shellInfo = peek.ShellFamily != null ? $" ({peek.ShellFamily})" : "";
+        var busyMark = peek.Busy ? "⧗ Busy" : "✓ Idle";
+        var sb = new StringBuilder();
+        sb.AppendLine($"{busyMark} {peek.DisplayName}{shellInfo} | Status: {peek.Status}");
+        if (peek.Busy && !string.IsNullOrEmpty(peek.RunningCommand))
+        {
+            var elapsedPart = peek.RunningElapsedSeconds.HasValue
+                ? $" ({peek.RunningElapsedSeconds.Value:F1}s elapsed)"
+                : "";
+            sb.AppendLine($"Running: {peek.RunningCommand}{elapsedPart}");
+        }
+        else if (peek.Busy)
+        {
+            var elapsedPart = peek.RunningElapsedSeconds.HasValue
+                ? $" ({peek.RunningElapsedSeconds.Value:F1}s elapsed)"
+                : "";
+            sb.AppendLine($"Running: (user-typed command, unknown){elapsedPart}");
+        }
+        sb.AppendLine();
+        sb.AppendLine("--- recent output ---");
+        sb.Append(string.IsNullOrEmpty(peek.RecentOutput) ? "(empty)" : peek.RecentOutput);
+        return sb.ToString();
     }
 
     /// <summary>

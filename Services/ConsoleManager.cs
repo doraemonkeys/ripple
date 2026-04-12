@@ -633,7 +633,8 @@ public class ConsoleManager
                 var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
                 var shellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily;
                 MarkPipeBusy(agentId, consolePid);
-                return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, ShellFamily = shellFamily, Command = command, Notice = routingNotice };
+                var partial = response.TryGetProperty("partialOutput", out var poProp) ? poProp.GetString() : null;
+                return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, ShellFamily = shellFamily, Command = command, Notice = routingNotice, PartialOutput = partial };
             }
 
             // Worker reported that its shell process exited before the
@@ -1025,6 +1026,82 @@ public class ConsoleManager
             return resp.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
         }
         catch { return null; }
+    }
+
+    public record PeekResult(
+        int Pid,
+        string DisplayName,
+        string? ShellFamily,
+        string Status,
+        bool Busy,
+        string? RunningCommand,
+        double? RunningElapsedSeconds,
+        string RecentOutput);
+
+    /// <summary>
+    /// Snapshot what a console has been emitting recently via the peek
+    /// pipe command. Lets the AI inspect a busy console (stuck command,
+    /// interactive prompt, user-typed command in progress) without
+    /// interrupting it or waiting for completion.
+    /// </summary>
+    /// <remarks>
+    /// If <paramref name="shell"/> is specified, peek targets the
+    /// active console of that shell family (or a standby if none is
+    /// active). Otherwise it targets the agent's current active console.
+    /// Returns null if there is no suitable console to peek at.
+    /// </remarks>
+    public async Task<PeekResult?> PeekConsoleAsync(string agentId, string? shell = null)
+    {
+        int? pid;
+        string? pipeName;
+        string? displayName;
+        string? shellFamily;
+
+        lock (_lock)
+        {
+            var state = GetOrCreateAgentState(agentId);
+            if (shell != null)
+            {
+                var targetFamily = NormalizeShellFamily(shell);
+                var match = _consoles
+                    .Where(kv => kv.Value.ShellFamily == targetFamily)
+                    .Select(kv => (int?)kv.Key)
+                    .FirstOrDefault();
+                pid = match;
+            }
+            else
+            {
+                pid = state.ActivePid != 0 ? state.ActivePid : (int?)null;
+            }
+
+            if (pid == null || !_consoles.TryGetValue(pid.Value, out var info))
+                return null;
+
+            pipeName = info.PipePath;
+            displayName = info.DisplayName;
+            shellFamily = info.ShellFamily;
+        }
+
+        try
+        {
+            var resp = await SendPipeRequestAsync(pipeName,
+                w => w.WriteString("type", "peek"),
+                TimeSpan.FromSeconds(3));
+
+            var status = resp.TryGetProperty("status", out var stProp) ? stProp.GetString() ?? "" : "";
+            var busy = resp.TryGetProperty("busy", out var bProp) && bProp.GetBoolean();
+            var runningCmd = resp.TryGetProperty("runningCommand", out var rcProp) && rcProp.ValueKind == JsonValueKind.String ? rcProp.GetString() : null;
+            double? elapsed = null;
+            if (resp.TryGetProperty("runningElapsedSeconds", out var esProp) && esProp.ValueKind == JsonValueKind.Number)
+                elapsed = esProp.GetDouble();
+            var recent = resp.TryGetProperty("recentOutput", out var roProp) ? roProp.GetString() ?? "" : "";
+
+            return new PeekResult(pid.Value, displayName!, shellFamily, status, busy, runningCmd, elapsed, recent);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -1789,6 +1866,11 @@ public class ConsoleManager
         public string? Cwd { get; set; }
         public bool Switched { get; set; }
         public bool TimedOut { get; set; }
+        // Populated only on TimedOut — the recent-output ring snapshot the
+        // worker captured at timeout. Lets the AI diagnose stuck commands
+        // (watch mode, interactive prompts) without waiting for
+        // wait_for_completion to drain the full cached result.
+        public string? PartialOutput { get; set; }
         // Free-form notice prepended to the response. Used to surface
         // out-of-band events like "the source console you came from has
         // been moved by the user, your last known cwd has been preserved".

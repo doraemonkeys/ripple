@@ -19,8 +19,17 @@ namespace SplashShell.Services;
 /// </summary>
 public class CommandTracker
 {
-    private const int MaxOutputBytes = 1024 * 1024; // 1MB
+    private const int MaxAiOutputBytes = 1024 * 1024; // 1MB
     private const int PostPrimaryMaxBytes = 64 * 1024; // 64 KB for trailing-output delta
+
+    // Rolling window of everything the PTY has emitted recently, regardless
+    // of whether an AI command was in flight or the user typed something
+    // themselves. Used by (a) execute_command's timeout response, which
+    // returns the tail of this buffer as `partialOutput` so the AI can
+    // diagnose stuck commands, and (b) the peek_console MCP tool, which
+    // lets the AI inspect a busy console on demand.
+    // Small and fixed-size so the token cost of returning it stays bounded.
+    private const int RecentOutputCapacity = 4096;
 
     // Non-SGR ANSI escape sequence pattern.
     // Strips cursor movement, erase, and other control sequences, but preserves
@@ -30,6 +39,7 @@ public class CommandTracker
     private static readonly Regex AnsiRegex = new(
         @"\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b\][^\x07]*\x07|\x1b\][^\x1b]*\x1b\\|\x1b[()][0-9A-B]",
         RegexOptions.Compiled);
+
 
     // pwsh prompt pattern: "PS <drive>:\<path>> "
     // ConPTY may emit this glued to the previous line via cursor positioning,
@@ -44,16 +54,24 @@ public class CommandTracker
     private bool _isAiCommand;
     private bool _userCommandBusy;
     private bool _shellReady; // flipped on first PromptStart; gates user-busy tracking
-    private string _output = "";
+    private string _aiOutput = "";
     private bool _truncated;
+
+    // Circular buffer storing the last RecentOutputCapacity chars of the
+    // PTY output stream (OSC-stripped but still with SGR colors/cursor
+    // escapes in it — the read side does final cleanup). Written to from
+    // FeedOutput unconditionally; snapshotted via GetRecentOutputSnapshot.
+    private readonly char[] _recentBuf = new char[RecentOutputCapacity];
+    private int _recentPos;     // next write index
+    private int _recentLen;     // count of valid chars, capped at capacity
     private int _exitCode;
     private string? _cwd;
     private string _commandSent = "";
     private Stopwatch? _stopwatch;
 
-    // Slice markers: _output position at OSC C (command about to run) and
+    // Slice markers: _aiOutput position at OSC C (command about to run) and
     // OSC D (command finished). CleanOutput slices [commandStart..commandEnd)
-    // from _output to produce the result, which cleanly excludes both the
+    // from _aiOutput to produce the result, which cleanly excludes both the
     // AcceptLine finalize rendering that PSReadLine writes between OSC B and
     // OSC C and the prompt text that comes after OSC D / OSC A.
     private int _commandStart = -1;
@@ -111,7 +129,7 @@ public class CommandTracker
 
             _tcs = new TaskCompletionSource<CommandResult>(TaskCreationOptions.RunContinuationsAsynchronously);
             _isAiCommand = true;
-            _output = "";
+            _aiOutput = "";
             _truncated = false;
             _exitCode = 0;
             _cwd = null;
@@ -164,7 +182,7 @@ public class CommandTracker
     /// <summary>
     /// Feed an OSC event from the parser. The caller must pass events in
     /// source order, interleaved with matching FeedOutput calls, so that
-    /// _output.Length at event-dispatch time is the offset at which the
+    /// _aiOutput.Length at event-dispatch time is the offset at which the
     /// event fired in the original byte stream.
     /// </summary>
     public void HandleEvent(OscParser.OscEvent evt)
@@ -180,6 +198,14 @@ public class CommandTracker
             // integration scripts emit at startup (and the subsequent prompt
             // setup) would otherwise leave the new console looking busy and
             // cause HandleExecuteAsync to reject the first incoming command.
+            // The FIRST PromptStart is also when we clear the recent-output
+            // ring: anything before it is pre-shell boot noise (or prior-
+            // session residue on a reused standby console) that isn't part
+            // of what the user would see on a fresh terminal. After that
+            // first reset, the ring accumulates naturally so peek_console
+            // shows the recent command history just like the terminal does.
+            if (evt.Type == OscParser.OscEventType.PromptStart && !_shellReady)
+                ResetRecentBuffer();
             if (evt.Type == OscParser.OscEventType.PromptStart)
                 _shellReady = true;
 
@@ -211,10 +237,10 @@ public class CommandTracker
             {
                 case OscParser.OscEventType.CommandExecuted:
                     // OSC C: PreCommandLookupAction has fired, everything
-                    // preceding this point in _output is AcceptLine finalize
+                    // preceding this point in _aiOutput is AcceptLine finalize
                     // noise. Record the position so CleanOutput knows where
                     // the real command output begins.
-                    _commandStart = _output.Length;
+                    _commandStart = _aiOutput.Length;
                     break;
 
                 case OscParser.OscEventType.CommandFinished:
@@ -222,7 +248,7 @@ public class CommandTracker
                     // print the prompt. Snapshot the position here so the
                     // prompt text is excluded from the result.
                     _exitCode = evt.ExitCode;
-                    _commandEnd = _output.Length;
+                    _commandEnd = _aiOutput.Length;
                     break;
 
                 case OscParser.OscEventType.Cwd:
@@ -253,23 +279,27 @@ public class CommandTracker
     }
 
     /// <summary>
-    /// Feed cleaned output from the PTY (OSC stripped). Always appends
-    /// during an AI command — the OSC C / OSC D position markers slice out
-    /// the useful portion at Resolve time, so we don't need conditional
-    /// capture or suppression flags here.
+    /// Feed cleaned output from the PTY (OSC stripped). During an AI command
+    /// the text is appended to _aiOutput for later OSC C/D slicing; outside
+    /// an AI command it goes to the post-primary drain buffer for the
+    /// proxy. In BOTH modes the text is also mirrored into _recentBuf, a
+    /// small rolling window that peek_console and execute timeout responses
+    /// return as "what's on screen right now" context.
     /// </summary>
     public void FeedOutput(string text)
     {
         lock (_lock)
         {
+            AppendRecent(text);
+
             if (_isAiCommand)
             {
-                if (_output.Length < MaxOutputBytes)
+                if (_aiOutput.Length < MaxAiOutputBytes)
                 {
-                    _output += text;
-                    if (_output.Length > MaxOutputBytes)
+                    _aiOutput += text;
+                    if (_aiOutput.Length > MaxAiOutputBytes)
                     {
-                        _output = _output[..MaxOutputBytes];
+                        _aiOutput = _aiOutput[..MaxAiOutputBytes];
                         _truncated = true;
                     }
                 }
@@ -286,6 +316,321 @@ public class CommandTracker
             if (remaining <= 0) return;
             if (text.Length <= remaining) _postPrimaryOutput.Append(text);
             else _postPrimaryOutput.Append(text, 0, remaining);
+        }
+    }
+
+    private void ResetRecentBuffer()
+    {
+        _recentPos = 0;
+        _recentLen = 0;
+    }
+
+    /// <summary>
+    /// Public hook to drop everything currently sitting in the
+    /// recent-output ring. Called by the ConsoleWorker when a new
+    /// proxy claims this console, so peek_console / timeout
+    /// partialOutput don't start out leaking bytes from whatever
+    /// the previous owner was running.
+    /// </summary>
+    public void ClearRecentOutput()
+    {
+        lock (_lock) ResetRecentBuffer();
+    }
+
+    private void AppendRecent(string text)
+    {
+        if (text.Length == 0) return;
+
+        // If this single write is larger than the ring, only the tail of
+        // it can ever survive — fast-path by copying the last N chars
+        // straight into buf[0..N] and setting pos/len appropriately.
+        if (text.Length >= RecentOutputCapacity)
+        {
+            text.AsSpan(text.Length - RecentOutputCapacity).CopyTo(_recentBuf);
+            _recentPos = 0;
+            _recentLen = RecentOutputCapacity;
+            return;
+        }
+
+        foreach (var ch in text)
+        {
+            _recentBuf[_recentPos] = ch;
+            _recentPos = (_recentPos + 1) % RecentOutputCapacity;
+            if (_recentLen < RecentOutputCapacity) _recentLen++;
+        }
+    }
+
+    /// <summary>
+    /// Snapshot the rolling recent-output window as a string, processed
+    /// through a VT-lite interpreter so in-place redraws from PSReadLine,
+    /// progress bars, and cursor-positioning escape sequences collapse to
+    /// their final state. Both peek_console and execute timeout responses
+    /// use this so the AI sees what the console actually displays, not
+    /// the concatenated history of every intermediate redraw.
+    /// </summary>
+    public string GetRecentOutputSnapshot()
+    {
+        string raw;
+        lock (_lock)
+        {
+            if (_recentLen == 0) return "";
+            if (_recentLen < RecentOutputCapacity)
+            {
+                raw = new string(_recentBuf, 0, _recentLen);
+            }
+            else
+            {
+                // Wrapped: valid data starts at _recentPos and wraps around.
+                var tmp = new char[RecentOutputCapacity];
+                var firstPart = RecentOutputCapacity - _recentPos;
+                Array.Copy(_recentBuf, _recentPos, tmp, 0, firstPart);
+                Array.Copy(_recentBuf, 0, tmp, firstPart, _recentPos);
+                raw = new string(tmp);
+            }
+        }
+        return VtLite(raw);
+    }
+
+    /// <summary>
+    /// Light VT-100 / ECMA-48 interpreter for the recent-output snapshot.
+    /// We don't implement a full terminal emulator — just enough to turn
+    /// cursor-positioning and line-redraw escape sequences into a
+    /// collapsed final-state text block, so peek_console shows something
+    /// close to what a human sees on screen.
+    ///
+    /// Multi-row screen model: a grow-on-demand list of rows plus a
+    /// (row, col) cursor. CUP / HVP address absolute rows (row 1-based
+    /// from the top of what we've seen), CUU/CUD move vertically, \n
+    /// advances to the next row, \r resets col to 0. This handles
+    /// ConPTY's absolute-row redraw pattern where a new command's input
+    /// line is painted on its own row via CUP, which the previous
+    /// single-row model collapsed onto the prior command's row and left
+    /// stale tail bytes in place.
+    /// </summary>
+    private static string VtLite(string input)
+    {
+        var state = new VtState();
+        int i = 0;
+        while (i < input.Length)
+        {
+            char c = input[i];
+            if (c == '\n') { state.LineFeed(); i++; }
+            else if (c == '\r') { state.CarriageReturn(); i++; }
+            else if (c == '\b') { state.Backspace(); i++; }
+            else if (c == '\t') { state.Tab(); i++; }
+            else if (c == '\x1b') { i = ParseEscape(input, i, state); }
+            else if (c >= ' ') { state.WriteChar(c); i++; }
+            else { i++; /* drop other C0 */ }
+        }
+        return state.Render();
+    }
+
+    /// <summary>
+    /// Virtual screen state for VtLite. Rows grow on demand; there is no
+    /// fixed viewport height, so CUP addresses into rows[0..] directly.
+    /// MaxRow tracks the highest row index written so the final render
+    /// can trim trailing empty rows.
+    /// </summary>
+    private sealed class VtState
+    {
+        public readonly List<StringBuilder> Rows = new() { new StringBuilder() };
+        public int Row;
+        public int Col;
+        public int MaxRow;
+
+        public void EnsureRow(int r)
+        {
+            while (Rows.Count <= r) Rows.Add(new StringBuilder());
+            if (r > MaxRow) MaxRow = r;
+        }
+
+        public void WriteChar(char c)
+        {
+            EnsureRow(Row);
+            var row = Rows[Row];
+            if (Col < row.Length) row[Col] = c;
+            else
+            {
+                while (row.Length < Col) row.Append(' ');
+                row.Append(c);
+            }
+            Col++;
+        }
+
+        public void LineFeed()
+        {
+            Row++;
+            Col = 0;
+            EnsureRow(Row);
+        }
+
+        public void CarriageReturn() { Col = 0; }
+        public void Backspace() { if (Col > 0) Col--; }
+        public void Tab() { Col = ((Col / 8) + 1) * 8; }
+
+        public void CursorUp(int n) { Row = Math.Max(0, Row - Math.Max(1, n)); }
+        public void CursorDown(int n) { Row += Math.Max(1, n); EnsureRow(Row); }
+        public void CursorForward(int n) { Col += Math.Max(1, n); }
+        public void CursorBack(int n) { Col = Math.Max(0, Col - Math.Max(1, n)); }
+        public void CursorCol(int c1) { Col = Math.Max(0, c1 - 1); }
+
+        public void CursorPos(int r1, int c1)
+        {
+            Row = Math.Max(0, r1 - 1);
+            Col = Math.Max(0, c1 - 1);
+            EnsureRow(Row);
+        }
+
+        public void EraseLine(int mode)
+        {
+            EnsureRow(Row);
+            var row = Rows[Row];
+            if (mode == 0)
+            {
+                if (Col < row.Length) row.Length = Col;
+            }
+            else if (mode == 1)
+            {
+                int end = Math.Min(Col + 1, row.Length);
+                for (int k = 0; k < end; k++) row[k] = ' ';
+            }
+            else if (mode == 2)
+            {
+                row.Clear();
+            }
+        }
+
+        public void EraseDisplay(int mode)
+        {
+            if (mode == 0)
+            {
+                EnsureRow(Row);
+                var row = Rows[Row];
+                if (Col < row.Length) row.Length = Col;
+                for (int r = Row + 1; r < Rows.Count; r++) Rows[r].Clear();
+            }
+            else if (mode == 1)
+            {
+                for (int r = 0; r < Row && r < Rows.Count; r++) Rows[r].Clear();
+                EnsureRow(Row);
+                var row = Rows[Row];
+                int end = Math.Min(Col + 1, row.Length);
+                for (int k = 0; k < end; k++) row[k] = ' ';
+            }
+            else if (mode == 2)
+            {
+                foreach (var r in Rows) r.Clear();
+                Row = 0;
+                Col = 0;
+                MaxRow = 0;
+            }
+        }
+
+        public string Render()
+        {
+            int endRow = MaxRow;
+            while (endRow > 0 && Rows[endRow].Length == 0) endRow--;
+            var sb = new StringBuilder();
+            for (int r = 0; r <= endRow; r++)
+            {
+                if (r > 0) sb.Append('\n');
+                sb.Append(Rows[r].ToString().TrimEnd());
+            }
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>
+    /// Parse an ESC sequence starting at position <paramref name="start"/>
+    /// (where input[start] == 0x1b), mutate the VT state, and return the
+    /// index of the byte immediately after the sequence.
+    /// </summary>
+    private static int ParseEscape(string input, int start, VtState state)
+    {
+        int i = start + 1;
+        if (i >= input.Length) return i;
+
+        char next = input[i];
+        if (next == '[')
+        {
+            // CSI — \e[<param bytes><intermediate><final>
+            int paramStart = i + 1;
+            int j = paramStart;
+            while (j < input.Length && input[j] >= 0x30 && input[j] <= 0x3f) j++;
+            var paramsStr = j > paramStart ? input.Substring(paramStart, j - paramStart) : "";
+            while (j < input.Length && input[j] >= 0x20 && input[j] <= 0x2f) j++;
+            if (j >= input.Length) return input.Length; // incomplete — drop rest
+            char final = input[j];
+            ApplyCsi(paramsStr, final, state);
+            return j + 1;
+        }
+        if (next == ']')
+        {
+            // OSC — \e]...(BEL or ST). Drop entire sequence.
+            int j = i + 1;
+            while (j < input.Length)
+            {
+                if (input[j] == '\x07') { j++; break; }
+                if (input[j] == '\x1b' && j + 1 < input.Length && input[j + 1] == '\\')
+                { j += 2; break; }
+                j++;
+            }
+            return j;
+        }
+        if (next == '(' || next == ')')
+        {
+            // Character set selection — \e(<char>
+            return Math.Min(i + 2, input.Length);
+        }
+        // Single-char ESC — skip it and the follower.
+        return Math.Min(i + 1, input.Length);
+    }
+
+    private static void ApplyCsi(string paramsStr, char final, VtState state)
+    {
+        // Private-mode sequences (DEC — \e[?25h etc.) — ignore entirely.
+        if (paramsStr.Length > 0 && paramsStr[0] == '?') return;
+
+        // Parse semicolon-separated numeric params. Empty == default.
+        string[] parts;
+        if (paramsStr.Length == 0) parts = Array.Empty<string>();
+        else parts = paramsStr.Split(';');
+
+        int Param(int idx, int def)
+        {
+            if (idx >= parts.Length) return def;
+            if (string.IsNullOrEmpty(parts[idx])) return def;
+            if (int.TryParse(parts[idx], out var n)) return n;
+            return def;
+        }
+
+        switch (final)
+        {
+            case 'A': state.CursorUp(Param(0, 1)); break;         // CUU
+            case 'B': state.CursorDown(Param(0, 1)); break;       // CUD
+            case 'C': state.CursorForward(Param(0, 1)); break;    // CUF
+            case 'D': state.CursorBack(Param(0, 1)); break;       // CUB
+            case 'E': state.CursorDown(Param(0, 1)); state.Col = 0; break; // CNL
+            case 'F': state.CursorUp(Param(0, 1)); state.Col = 0; break;   // CPL
+            case 'G': state.CursorCol(Param(0, 1)); break;        // CHA
+            case 'H':                                              // CUP
+            case 'f':                                              // HVP
+                state.CursorPos(Param(0, 1), Param(1, 1));
+                break;
+            case 'K': state.EraseLine(Param(0, 0)); break;        // EL
+            case 'J': state.EraseDisplay(Param(0, 0)); break;     // ED
+            case 'd': state.Row = Math.Max(0, Param(0, 1) - 1); state.EnsureRow(state.Row); break; // VPA
+            case 'm': // SGR — colors/attrs, no-op
+            case 's': // save cursor
+            case 'u': // restore cursor
+            case 'r': // scroll region
+            case 'n': // device status report
+            case 'c': // device attributes
+            case 't': // window manipulation
+                break;
+            default:
+                // Unknown final byte — drop silently.
+                break;
         }
     }
 
@@ -421,20 +766,20 @@ public class CommandTracker
     }
 
     /// <summary>
-    /// Slice the command-output window out of _output and clean it up.
+    /// Slice the command-output window out of _aiOutput and clean it up.
     /// The window is [_commandStart, _commandEnd), filled in by OSC C and
     /// OSC D. If OSC C never fired (parse error, OSC markers misconfigured)
     /// we fall back to the whole buffer. If OSC D never fired but OSC A did
-    /// (unusual), we take everything up to _output.Length.
+    /// (unusual), we take everything up to _aiOutput.Length.
     /// </summary>
     private string CleanOutput()
     {
         var start = _commandStart >= 0 ? _commandStart : 0;
-        var end = _commandEnd >= 0 ? _commandEnd : _output.Length;
+        var end = _commandEnd >= 0 ? _commandEnd : _aiOutput.Length;
         if (end < start) end = start;
-        if (end > _output.Length) end = _output.Length;
+        if (end > _aiOutput.Length) end = _aiOutput.Length;
 
-        var raw = _output.Substring(start, end - start);
+        var raw = _aiOutput.Substring(start, end - start);
 
         var output = StripAnsi(raw);
         var lines = output.Split('\n');
@@ -453,6 +798,16 @@ public class CommandTracker
         if (_truncated)
             result += "\n\n[Output truncated at 1MB]";
         return result;
+    }
+
+    /// <summary>
+    /// Test hook — force-seed the ring buffer. Only used by
+    /// CommandTrackerTests to verify GetRecentOutputSnapshot without
+    /// having to plumb a full PTY.
+    /// </summary>
+    internal void SeedRecentForTests(string text)
+    {
+        lock (_lock) AppendRecent(text);
     }
 
     /// <summary>
@@ -476,11 +831,14 @@ public class CommandTracker
     {
         _tcs = null;
         _isAiCommand = false;
-        _output = "";
+        _aiOutput = "";
         _commandSent = "";
         _stopwatch = null;
         _commandStart = -1;
         _commandEnd = -1;
+        // _recentBuf survives deliberately — it's a rolling window
+        // spanning command boundaries so peek_console can still show
+        // what was on screen just before/during the next call.
     }
 
     private static string StripAnsi(string text)
@@ -490,4 +848,5 @@ public class CommandTracker
         text = text.Replace("\r", "");       // remove any remaining standalone CR
         return text;
     }
+
 }

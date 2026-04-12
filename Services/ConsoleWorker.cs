@@ -1015,6 +1015,17 @@ public class ConsoleWorker
                 else w.WriteNull("runningElapsedSeconds");
             }),
             "get_cached_output" => HandleGetCachedOutput(),
+            "peek" => SerializeResponse(w =>
+            {
+                var snapshot = _tracker.GetRecentOutputSnapshot();
+                w.WriteString("status", Status);
+                w.WriteBoolean("busy", _tracker.Busy);
+                w.WriteStringOrNull("runningCommand", _tracker.RunningCommand);
+                var elapsed = _tracker.RunningElapsedSeconds;
+                if (elapsed.HasValue) w.WriteNumber("runningElapsedSeconds", elapsed.Value);
+                else w.WriteNull("runningElapsedSeconds");
+                w.WriteString("recentOutput", snapshot);
+            }),
             "drain_post_output" => await HandleDrainPostOutputAsync(request, ct),
             "set_title" => HandleSetTitle(request),
             "display_banner" => HandleDisplayBanner(request),
@@ -1270,6 +1281,12 @@ public class ConsoleWorker
         }
         catch (TimeoutException)
         {
+            // Include the tail of the recent-output ring as partialOutput so
+            // the AI can diagnose why the command is still running (watch
+            // mode, stuck at an interactive prompt, etc.) without paying
+            // for the full _aiOutput buffer. Bounded by the ring's fixed
+            // capacity so token cost stays predictable.
+            var partial = _tracker.GetRecentOutputSnapshot();
             return SerializeResponse(w =>
             {
                 w.WriteString("output", "");
@@ -1277,6 +1294,8 @@ public class ConsoleWorker
                 w.WriteNull("cwd");
                 w.WriteString("duration", (timeoutMs / 1000.0).ToString("F1"));
                 w.WriteBoolean("timedOut", true);
+                if (!string.IsNullOrEmpty(partial))
+                    w.WriteString("partialOutput", partial);
             });
         }
         catch (InvalidOperationException ex)
@@ -1477,6 +1496,16 @@ public class ConsoleWorker
 
         var newPipeName = $"{ConsoleManager.PipePrefix}.{proxyPid}.{agentId}.{Environment.ProcessId}";
         if (title != null) Console.Title = title;
+
+        // New proxy taking ownership — drop whatever is in the
+        // recent-output ring. Anything captured before this moment
+        // belonged to a previous MCP session (the shell was already
+        // running when the human restarted Claude Code or launched a
+        // new proxy), and exposing those bytes via peek_console would
+        // show content that isn't part of the current session's
+        // terminal view. The ring will refill with current-session
+        // bytes as the new proxy issues commands.
+        _tracker.ClearRecentOutput();
 
         // Signal the main loop to start the new owned pipe
         _claimTcs?.TrySetResult(newPipeName);
