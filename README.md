@@ -4,70 +4,65 @@
   <img src="https://github.com/user-attachments/assets/1343f694-1c05-4899-9faa-d2b1138aa3ba" alt="social-image" width="640" />
 </div>
 
-A universal MCP server that exposes any shell (bash, pwsh, powershell, cmd) as a Model Context Protocol server, so AI assistants can run real commands in a real terminal — visible to you, with session state that persists across calls.
+A universal MCP server that gives AI assistants a **real, visible terminal** — the same one you're looking at. Run any shell (bash, pwsh, cmd), see every command the AI executes, type into the same console yourself, and keep session state alive across calls.
 
 ## Why splashshell?
 
-**A persistent shell session changes what AI can do — especially with PowerShell.**
+Most shell MCP servers fall into one of two buckets: **stateless** (each command runs in an isolated subprocess — nothing persists) or **headless** (the AI has a persistent PTY, but you can't see it or type into it). splashshell is neither.
 
-Most MCP tool servers run each command in an isolated subprocess — no state carries over, no modules stay loaded, no authentication survives between calls. For bash, that mostly means losing environment variables. For **PowerShell, it means losing everything**: authenticated service connections, imported modules with their initialization cost, .NET types compiled via `Add-Type`, rich object variables you've been building up across commands, custom functions, `$PSDefaultParameterValues` — the entire runtime context that makes PowerShell powerful.
+### You and AI share the same terminal
 
-splashshell gives AI assistants a real, continuous shell session where all of this persists:
+splashshell opens a **real, visible terminal window**. When the AI runs a command, you see it happen in real time — the same characters, the same output, the same prompt. You can type into the same terminal at any time. The AI can see what you typed via `peek_console`. This isn't a web dashboard or a log viewer — it's the actual terminal.
 
-### Module import cost
+No other standalone MCP server does this. Headless PTY servers like [interactive-shell-mcp](https://github.com/lightos/interactive-shell-mcp) give the AI a terminal it can peek at and send input to, but you as the user can't see or interact with it. tmux-based servers like [tmux-mcp](https://github.com/nickgnd/tmux-mcp) require tmux and don't run on Windows. splashshell's shared console works on Windows out of the box and doesn't need any external tools.
 
-PowerShell modules aren't free to load. A cold `Import-Module Az.Compute, Az.Storage` can take **over a minute** as the runtime loads and JIT-compiles the assemblies. In an isolated-subprocess model, every command pays this cost. With splashshell, the AI imports once and the module stays loaded — every subsequent cmdlet call returns in under a second:
+### The AI can see the screen and respond to it
+
+When a command times out or gets stuck, the AI isn't blind:
+
+1. **`execute_command` times out** → response includes a `partialOutput` snapshot of the screen
+2. **`peek_console`** → read-only snapshot of what the terminal is currently displaying (on Windows: exact screen buffer read via native API)
+3. **`send_input`** → send keystrokes to the running command: Enter for prompts, Ctrl+C to interrupt, arrow keys for TUI navigation
+
+This means the AI can diagnose and respond to interactive prompts (`Read-Host`, password dialogs, `y/n` confirmations), exit watch-mode processes, or kill stuck commands — without human intervention.
+
+### Session state persists — and that matters most for PowerShell
+
+All shells benefit from persistent sessions (environment variables, command history, working directory). But for **PowerShell, session persistence is critical**:
+
+- **Module import cost**: A cold `Import-Module Az.Compute, Az.Storage` takes **30–70 seconds**. With splashshell, the AI imports once and every subsequent cmdlet call returns in under a second
+- **Object pipeline**: PowerShell passes .NET objects, not text. `$issues = gh issue list ... | ConvertFrom-Json` stores a rich object — filter it, transform it, join it across commands. In an isolated subprocess, that object vanishes after each call
+- **10,000+ modules on [PowerShell Gallery](https://www.powershellgallery.com/)**: Az, AWS.Tools, Microsoft.Graph, ExchangeOnlineManagement, PnP.PowerShell — plus any CLI tool (git, docker, kubectl, terraform, gh)
 
 ```powershell
-# Command 1: one-time cold import (can take 30–70 seconds)
+# Command 1: one-time cold import (30–70 seconds)
 Import-Module Az.Compute, Az.Storage
 
 # Command 2 (instant — module already loaded)
 Get-AzVM -Status | Where-Object PowerState -eq "VM running" |
     Select-Object Name, @{N='Size';E={$_.HardwareProfile.VmSize}}, Location
 
-# Command 3 (instant)
+# Command 3 (instant — session is still alive)
 Get-AzStorageAccount | Select-Object StorageAccountName, Location, Kind
 ```
 
-[PowerShell Gallery](https://www.powershellgallery.com/) offers 10,000+ modules — Az, AWS.Tools, Microsoft.Graph, ExchangeOnlineManagement, PnP.PowerShell, and more. Plus any CLI tool (git, docker, kubectl, terraform, gh) is available in the same session.
+### Structured command lifecycle
 
-### Object pipeline across calls
+splashshell injects [OSC 633 shell integration](https://code.visualstudio.com/docs/terminal/shell-integration) scripts (the same protocol VS Code uses) into every shell it starts. This gives it reliable, marker-based detection of:
+- When a command starts and finishes (not heuristic — explicit markers)
+- The exit code
+- The current working directory after each command
+- Whether the console is busy with a user-typed command
 
-PowerShell passes **objects, not text**. A variable holds a rich .NET object with properties and methods — filter it, transform it, join it with data from another service, all across separate commands:
+Other MCP servers rely on output-silence heuristics (`waitForIdle`) or prompt-string detection, which break on slow commands, multi-line output, or non-standard prompts.
 
-```powershell
-# Command 1: collect structured data
-$issues = gh issue list --repo PowerShell/PowerShell --json title,author,labels | ConvertFrom-Json
+## More features
 
-# Command 2: filter with object properties (not grep — real property access)
-$bugs = $issues | Where-Object { $_.labels.name -contains "Issue-Bug" }
-
-# Command 3: project and format
-$bugs | Select-Object title, @{N='by';E={$_.author.login}} | Format-Table
-```
-
-In an isolated subprocess, `$issues` and `$bugs` would vanish after each call. With splashshell, the AI builds up complex data structures incrementally — just like a human working in a live console.
-
-### Module ecosystem
-
-[PowerShell Gallery](https://www.powershellgallery.com/) offers 10,000+ modules. Some take seconds to import (`Az` can take 5–10 s). With persistent sessions, `Import-Module` runs once and every subsequent call uses the loaded cmdlets instantly. Plus any CLI tool (git, docker, kubectl, terraform, gh, az cli) is available in the same session.
-
-### Works with any shell
-
-While PowerShell benefits most from session persistence, splashshell supports **bash, cmd, and any other shell** too. Environment variables, shell functions, and command history persist across calls in all shells.
-
-## Features
-
-- **Real terminal, real output.** Commands run in a visible ConPTY-backed console. You see every character the AI types, just as if you typed it yourself.
 - **Multiple shells side by side.** bash, pwsh, cmd, and others can all be active at the same time. Switch between them per command.
-- **Session state persists.** Authentication, modules, variables, functions, `cd`, and shell history all carry across calls — it's one continuous shell, not isolated subprocess spawns.
-- **Shell integration built in.** OSC 633 markers delimit command boundaries cleanly, so output parsing is reliable even for interleaved prompts and long-running commands.
-- **Console re-claim.** Consoles outlive their parent MCP process. When the AI client restarts, the next session reattaches to existing consoles — including any authenticated sessions.
+- **Console re-claim.** Consoles outlive their parent MCP process. When the AI client restarts, the next session reattaches to existing consoles — modules stay loaded, variables survive.
 - **Auto cwd handoff.** When a same-shell console is busy, a new one is auto-started in the source console's directory and your command runs immediately — no manual `cd` needed.
-- **Peek at busy consoles.** `peek_console` reads the terminal's current display — on Windows via the native screen buffer API, on other platforms via a built-in VT interpreter. Diagnose stuck commands, watch mode, and interactive prompts without interrupting.
-- **Send input to running commands.** `send_input` feeds keystrokes (Enter, Ctrl+C, arrow keys, text) to a busy console's PTY. Respond to `Read-Host` prompts, dismiss pauses, or interrupt runaway processes.
-- **Multi-line command support.** Multi-line PowerShell (heredocs, foreach, try/catch, nested scriptblocks) is handled via tempfile dot-sourcing — session state persists, history stays clean.
+- **Cwd drift detection.** If you manually `cd` in the terminal, the AI is warned before its next command — no silent execution in the wrong directory.
+- **Multi-line PowerShell.** heredocs, foreach, try/catch, nested scriptblocks — handled via tempfile dot-sourcing. Session state persists, history stays clean.
 - **Sub-agent isolation.** Allocate per-agent consoles with `is_subagent` + `agent_id` so parallel agents don't clobber each other's shells.
 
 ## Architecture
