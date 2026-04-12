@@ -1300,7 +1300,7 @@ public class ConsoleWorker
         var command = request.TryGetProperty("command", out var cmdProp) ? cmdProp.GetString() ?? "" : "";
         if (string.IsNullOrEmpty(command))
             return SerializeResponse(w => w.WriteString("error", "Missing 'command' field in request"));
-        var timeoutMs = request.TryGetProperty("timeout", out var tp) ? tp.GetInt32() : 170_000;
+        var timeoutMs = request.TryGetProperty("timeout", out var tp) ? tp.GetInt32() : 30_000;
 
         // Reject if another command is still running (e.g., timed-out command in background)
         if (_tracker.Busy)

@@ -127,7 +127,7 @@ public class CommandTracker
     /// Register an AI-initiated command. Returns a Task that completes
     /// when the shell signals command completion via OSC markers.
     /// </summary>
-    public Task<CommandResult> RegisterCommand(string commandText, int timeoutMs = 170_000)
+    public Task<CommandResult> RegisterCommand(string commandText, int timeoutMs = 30_000)
     {
         // Minimum 1 second to avoid CancellationTokenSource(0) race conditions
         timeoutMs = Math.Max(timeoutMs, 1000);

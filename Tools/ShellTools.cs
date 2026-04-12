@@ -52,8 +52,8 @@ public class ShellTools
         string pipeline,
         [Description("Shell type to execute in (bash, pwsh, zsh, or full path). If omitted, uses the current active console. If specified and no matching console exists, one is auto-started.")]
         string? shell = null,
-        [Description("Timeout in seconds (0-170, default: 170). On timeout, execution continues and output is cached for wait_for_completion.")]
-        int timeout_seconds = 170,
+        [Description("Timeout in seconds (default: 30). On timeout, execution continues in the background and output is cached for wait_for_completion. The timeout response includes a partialOutput snapshot so you can diagnose immediately. Increase for known long-running commands (builds, module imports).")]
+        int timeout_seconds = 30,
         [Description("Agent ID for sub-agent console isolation.")]
         string? agent_id = null,
         CancellationToken cancellationToken = default)
