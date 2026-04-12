@@ -16,10 +16,10 @@ splashshell gives AI assistants a real, continuous shell session where all of th
 
 ### Module import cost
 
-PowerShell modules aren't free to load. `Import-Module Az` can take **5–10 seconds**; `Microsoft.Graph` is similarly heavy. In an isolated-subprocess model, every command pays this cost. With splashshell, the AI imports once and the module stays loaded — every subsequent cmdlet call is instant:
+PowerShell modules aren't free to load. A cold `Import-Module Az.Compute, Az.Storage` can take **over a minute** as the runtime loads and JIT-compiles the assemblies. In an isolated-subprocess model, every command pays this cost. With splashshell, the AI imports once and the module stays loaded — every subsequent cmdlet call returns in under a second:
 
 ```powershell
-# Command 1: one-time cost (~8 seconds)
+# Command 1: one-time cold import (can take 30–70 seconds)
 Import-Module Az.Compute, Az.Storage
 
 # Command 2 (instant — module already loaded)
