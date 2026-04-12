@@ -8,43 +8,54 @@ A universal MCP server that exposes any shell (bash, pwsh, powershell, cmd) as a
 
 ## Why splashshell?
 
-**A persistent shell session changes what AI can do.**
+**A persistent shell session changes what AI can do — especially with PowerShell.**
 
-Most MCP tool servers run each command in an isolated subprocess — no state carries over, no modules stay loaded, no authentication survives between calls. splashshell gives AI assistants a real, continuous shell session: authenticate once to Azure and every subsequent `Get-AzVM` just works; `Import-Module` a library and it stays available; define a variable or function and use it ten commands later.
+Most MCP tool servers run each command in an isolated subprocess — no state carries over, no modules stay loaded, no authentication survives between calls. For bash, that mostly means losing environment variables. For **PowerShell, it means losing everything**: authenticated service connections, imported modules with their initialization cost, .NET types compiled via `Add-Type`, rich object variables you've been building up across commands, custom functions, `$PSDefaultParameterValues` — the entire runtime context that makes PowerShell powerful.
 
-This means:
-- **Authenticate once, stay authenticated** — Azure (`Connect-AzAccount`), AWS (`Set-AWSCredential`), Microsoft 365 (`Connect-MgGraph`), and any other service that stores credentials in the session
-- **Modules persist** — `Install-Module` and `Import-Module` once, use the cmdlets across all subsequent calls without re-importing
-- **Variables and functions carry over** — define `$results` in one command, filter it in the next, export it in the third. Build up complex state incrementally
-- **One server, many ecosystems** — 10,000+ modules on [PowerShell Gallery](https://www.powershellgallery.com/), plus any CLI tool (git, docker, kubectl, terraform, gh, az cli)
-- **Cross-service workflows** — pipe Azure output into Graph API calls into CSV exports, all in a single session
+splashshell gives AI assistants a real, continuous shell session where all of this persists:
 
-**Examples: persistent session in action**
+### Persistent authentication
 
-*Authenticate and query across multiple commands:*
+PowerShell modules store authentication tokens **in the session**. Without persistence, the AI would need to re-authenticate before every single call:
+
 ```powershell
-# Command 1: authenticate
+# Command 1: authenticate (interactive browser flow, MFA, etc.)
 Connect-AzAccount
 
-# Command 2 (later): use the live session
+# Command 2 (minutes later): session is still alive — no re-auth
 Get-AzVM -Status | Where-Object PowerState -eq "VM running" |
     Select-Object Name, @{N='Size';E={$_.HardwareProfile.VmSize}}, Location
 
-# Command 3 (later still): session is still alive
+# Command 3 (hours later): still authenticated
 Get-AzStorageAccount | Select-Object StorageAccountName, Location, Kind
 ```
 
-*Build up data across calls:*
+This applies to every PowerShell service module: Azure (`Connect-AzAccount`), AWS (`Set-AWSCredential`), Microsoft 365 (`Connect-MgGraph`), Exchange Online (`Connect-ExchangeOnline`), SharePoint (`Connect-PnPOnline`), and more.
+
+### Object pipeline across calls
+
+PowerShell passes **objects, not text**. A variable holds a rich .NET object with properties and methods — filter it, transform it, join it with data from another service, all across separate commands:
+
 ```powershell
-# Command 1: collect data
+# Command 1: collect structured data
 $issues = gh issue list --repo PowerShell/PowerShell --json title,author,labels | ConvertFrom-Json
 
-# Command 2: filter (variable persists)
+# Command 2: filter with object properties (not grep — real property access)
 $bugs = $issues | Where-Object { $_.labels.name -contains "Issue-Bug" }
 
-# Command 3: report
+# Command 3: project and format
 $bugs | Select-Object title, @{N='by';E={$_.author.login}} | Format-Table
 ```
+
+In an isolated subprocess, `$issues` and `$bugs` would vanish after each call. With splashshell, the AI builds up complex data structures incrementally — just like a human working in a live console.
+
+### Module ecosystem
+
+[PowerShell Gallery](https://www.powershellgallery.com/) offers 10,000+ modules. Some take seconds to import (`Az` can take 5–10 s). With persistent sessions, `Import-Module` runs once and every subsequent call uses the loaded cmdlets instantly. Plus any CLI tool (git, docker, kubectl, terraform, gh, az cli) is available in the same session.
+
+### Works with any shell
+
+While PowerShell benefits most from session persistence, splashshell supports **bash, cmd, and any other shell** too. Environment variables, shell functions, and command history persist across calls in all shells.
 
 ## Features
 
