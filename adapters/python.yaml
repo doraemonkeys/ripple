@@ -93,13 +93,20 @@ output:
 
 input:
   line_ending: "\r"
-  # Python is indent-sensitive, so counting brackets alone can't decide
-  # when a multi-line block is complete. For now, rely on the caller
-  # (splash execute_command) to hand us already-complete blocks and
-  # submit them line by line. multiline delivery via tempfile comes in
-  # a follow-up once we have exec(open(...).read()) wrapping plumbed.
+  # Python is indent-sensitive and the parser-based REPL needs a
+  # trailing blank line to close compound statements, so typing a
+  # def/class/if/for block straight into the PTY only works with
+  # line-by-line submission plus a manual terminator. Instead,
+  # multi-line command bodies are written to a .splash-exec-*.py
+  # tempfile and the single-line call below runs it in the REPL's
+  # __main__ namespace (definitions leak out, cleanup via finally).
   multiline_detect: none
-  multiline_delivery: direct
+  multiline_delivery: tempfile
+  tempfile:
+    prefix: .splash-exec-
+    extension: .py
+    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.py"
+    invocation_template: '_splash_exec_file(r"{path}")'
   chunk_delay_ms: 0
 
 signals:

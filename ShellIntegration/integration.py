@@ -75,6 +75,30 @@ class _SplashPS2:
 sys.ps1 = _SplashPS1()
 sys.ps2 = _SplashPS2()
 
+
+def _splash_exec_file(path):
+    """Exec a splash-written tempfile in the REPL's __main__ scope, then
+    delete it. Used by splash's multi-line command delivery path:
+    instead of typing a def/class/if block into the REPL (which the
+    parser-based REPL would need a trailing blank line to close), splash
+    writes the whole block to a tempfile and sends
+    _splash_exec_file(r"...") as a single-line call. Definitions leak
+    into the REPL namespace because we pass globals() as the exec
+    namespace — same as if the user had typed them directly.
+    """
+    import os as _os
+    try:
+        with open(path, "rb") as f:
+            src = f.read()
+        code = compile(src, path, "exec")
+        exec(code, globals())
+    finally:
+        try:
+            _os.unlink(path)
+        except Exception:
+            pass
+
+
 # Self-delete the tempfile so a long-running splash process doesn't
 # leave stale integration files scattered across TEMP. On Windows,
 # Python has already closed the file by the time this line runs (the

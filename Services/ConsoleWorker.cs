@@ -1786,6 +1786,34 @@ public class ConsoleWorker
             }
             ptyPayload = $". '{unixPath}'; rm -f '{unixPath}'" + enter;
         }
+        else if (command.Contains('\n') &&
+                 _adapter?.Input.MultilineDelivery == "tempfile" &&
+                 _adapter.Input.Tempfile?.InvocationTemplate is { } invocationTpl)
+        {
+            // Generic adapter-driven tempfile delivery for multi-line REPL
+            // commands. Used today by Python (whose parser-based REPL needs
+            // a trailing blank line to close def/class/if blocks and would
+            // otherwise capture output from a half-submitted block). A
+            // future Node or Ruby adapter that declares multiline_delivery:
+            // tempfile picks this path up for free.
+            //
+            // The body is written to adapter.input.tempfile.{prefix,extension}
+            // and the adapter-supplied invocation_template (e.g.
+            // _splash_exec_file(r"{path}") for python) is sent to the PTY
+            // as a single line. The helper referenced by the template is
+            // expected to have been registered by the adapter's
+            // init.script_resource at REPL startup and is responsible for
+            // cleanup so interrupted commands still delete their tempfile.
+            var tmpPrefix = _adapter.Input.Tempfile.Prefix ?? ".splash-exec-";
+            var tmpExt = _adapter.Input.Tempfile.Extension ?? "";
+            var tmpFile = Path.Combine(
+                Path.GetTempPath(),
+                $"{tmpPrefix}{Environment.ProcessId}-{Guid.NewGuid():N}{tmpExt}");
+            var body = command.Replace("\r\n", "\n");
+            if (!body.EndsWith('\n')) body += "\n";
+            await File.WriteAllTextAsync(tmpFile, body, ct);
+            ptyPayload = ExpandTemplate(invocationTpl, ("path", tmpFile)) + enter;
+        }
         else
         {
             ptyPayload = command + enter;
