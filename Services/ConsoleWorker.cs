@@ -75,6 +75,20 @@ public class ConsoleWorker
     /// progressively replace those branches with adapter-driven reads.
     /// </summary>
     private readonly Adapter? _adapter;
+
+    /// <summary>
+    /// Milestone 2i: precomputed shell-family info so in-worker code never
+    /// has to call the ConsoleManager helpers that phase B is tearing out.
+    ///
+    /// _shellFamily is the normalized family key (e.g. "pwsh", "bash");
+    /// _isPwshFamily is true for pwsh / powershell;
+    /// _defaultEnter is the PTY line-ending to use for this shell —
+    /// adapter.input.line_ending when loaded, else the legacy
+    /// "\r for pwsh/cmd, \n for everything else" rule.
+    /// </summary>
+    private readonly string _shellFamily;
+    private readonly bool _isPwshFamily;
+    private readonly string _defaultEnter;
     private IPtySession? _pty;
     private Stream? _writer;
     private readonly OscParser _parser = new();
@@ -126,11 +140,19 @@ public class ConsoleWorker
         // Adapter shadow lookup (phase B, Milestone 2a). Normalize the
         // shell path to a family name and look it up in the registry.
         // Null result means we fall through to the hardcoded paths.
-        var shellFamily = ConsoleManager.NormalizeShellFamily(shell);
-        _adapter = AdapterRegistry.Default?.Find(shellFamily);
+        _shellFamily = ConsoleManager.NormalizeShellFamily(shell);
+        _adapter = AdapterRegistry.Default?.Find(_shellFamily);
         Log(_adapter != null
             ? $"Adapter matched: name={_adapter.Name} family={_adapter.Family} version={_adapter.Version}"
-            : $"No adapter matched for shell family '{shellFamily}' — using hardcoded fallback");
+            : $"No adapter matched for shell family '{_shellFamily}' — using hardcoded fallback");
+
+        // Milestone 2i: bake shell-family booleans into readonly fields so
+        // no in-worker code needs ConsoleManager.IsPowerShellFamily /
+        // EnterKeyFor after this constructor returns. Those helpers are
+        // removed from ConsoleManager as part of this milestone.
+        _isPwshFamily = _shellFamily is "pwsh" or "powershell";
+        _defaultEnter = _adapter?.Input.LineEnding
+            ?? (_isPwshFamily || _shellFamily == "cmd" ? "\r" : "\n");
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -153,7 +175,7 @@ public class ConsoleWorker
         // other shells, write directly to the worker's stdout here. (TODO:
         // bash/zsh/cmd have the same ConPTY-wipe issue and would also
         // benefit from shell-side emission.)
-        if (!ConsoleManager.IsPowerShellFamily(ConsoleManager.NormalizeShellFamily(_shell)))
+        if (!_isPwshFamily)
             WriteBanner();
 
         // Prepare shell integration script BEFORE launching the shell.
@@ -164,12 +186,12 @@ public class ConsoleWorker
         // Use the visible console's actual dimensions instead of hardcoded 120x30.
         // MSYS2/Git Bash needs the parent's environment (MSYSTEM, HOME, PATH with Git paths).
         // pwsh uses a clean environment to avoid inheriting MCP server variables.
-        var shellName = ConsoleManager.NormalizeShellFamily(_shell);
+        var shellName = _shellFamily;
         // Milestone 2b: inherit_environment comes from the adapter when
         // one is loaded for this shell, else falls back to the hardcoded
         // "pwsh family = clean env, everyone else = inherit" rule.
         bool inheritEnv = _adapter?.Process.InheritEnvironment
-            ?? !ConsoleManager.IsPowerShellFamily(shellName);
+            ?? !_isPwshFamily;
         int cols = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
         int rows = Console.WindowHeight > 0 ? Console.WindowHeight : 30;
         _pty = PtyFactory.Start(commandLine, _cwd, cols, rows, inheritEnvironment: inheritEnv);
@@ -192,7 +214,7 @@ public class ConsoleWorker
         // = "\r", bash/zsh = "\n"), else falls back to the hardcoded
         // family-based rule.
         var enter = _adapter?.Input.LineEnding
-            ?? ConsoleManager.EnterKeyFor(shellName);
+            ?? _defaultEnter;
 
         // Milestone 2f: ready-phase orchestration is driven by adapter.Ready
         // fields. Three paths emerge from the four shells:
@@ -211,11 +233,11 @@ public class ConsoleWorker
         // cmd path (kick-before-ready) and the bash/zsh path (inject +
         // kick-after-ready), since both have kick_enter_after_ready=true.
         var settleMs = _adapter?.Ready.SettleBeforeInjectMs
-            ?? (ConsoleManager.IsPowerShellFamily(shellName) ? 0 : 2000);
+            ?? (_isPwshFamily ? 0 : 2000);
         var suppressMirror = _adapter?.Ready.SuppressMirrorDuringInject
-            ?? (!ConsoleManager.IsPowerShellFamily(shellName) && shellName is not "cmd");
+            ?? (!_isPwshFamily && shellName is not "cmd");
         var kickEnter = _adapter?.Ready.KickEnterAfterReady
-            ?? !ConsoleManager.IsPowerShellFamily(shellName);
+            ?? !_isPwshFamily;
         var delayAfterInject = _adapter?.Ready.DelayAfterInjectMs
             ?? (suppressMirror ? 500 : 0);
 
@@ -391,9 +413,9 @@ public class ConsoleWorker
     /// </summary>
     private string BuildCommandLine()
     {
-        var shellName = ConsoleManager.NormalizeShellFamily(_shell);
+        var shellName = _shellFamily;
 
-        if (ConsoleManager.IsPowerShellFamily(shellName))
+        if (_isPwshFamily)
         {
             // Milestone 2d: integration script comes from the adapter when
             // loaded (YAML's script_resource is resolved to the embedded
@@ -548,7 +570,7 @@ public class ConsoleWorker
         // injected via BuildCommandLine's -Command argument, and cmd sets
         // its PROMPT at /k startup. So the old dead pwsh branch here used
         // to never fire — it's gone now.
-        var shellName = ConsoleManager.NormalizeShellFamily(_shell);
+        var shellName = _shellFamily;
         // Milestone 2d: prefer adapter's IntegrationScript (resolved from
         // YAML's script_resource at load time), fall back to the old
         // shell-family dispatch for shells without an adapter.
@@ -1027,9 +1049,9 @@ public class ConsoleWorker
                 //   - No ENABLE_PROCESSED_INPUT: Ctrl+C → \x03 (not signal)
                 SetConsoleMode(hStdIn, ENABLE_VIRTUAL_TERMINAL_INPUT);
 
-                var shellName = ConsoleManager.NormalizeShellFamily(_shell);
+                var shellName = _shellFamily;
                 // pwsh and cmd.exe understand win32-input-mode natively; only Unix shells need translation
-                bool needsTranslation = !ConsoleManager.IsPowerShellFamily(shellName) && shellName is not "cmd";
+                bool needsTranslation = !_isPwshFamily && shellName is not "cmd";
 
                 var charBuf = new char[256];
                 var pending = needsTranslation ? new StringBuilder() : null;
@@ -1411,7 +1433,7 @@ public class ConsoleWorker
             {
                 w.WriteString("status", Status);
                 w.WriteBoolean("hasCachedOutput", _tracker.HasCachedOutput);
-                w.WriteString("shellFamily", ConsoleManager.NormalizeShellFamily(_shell));
+                w.WriteString("shellFamily", _shellFamily);
                 w.WriteString("shellPath", _shell);
                 w.WriteStringOrNull("cwd", _tracker.LastKnownCwd);
                 w.WriteStringOrNull("runningCommand", _tracker.RunningCommand);
@@ -1468,7 +1490,7 @@ public class ConsoleWorker
     /// </summary>
     private async Task<JsonElement> HandleDrainPostOutputAsync(JsonElement request, CancellationToken ct)
     {
-        if (ConsoleManager.IsPowerShellFamily(ConsoleManager.NormalizeShellFamily(_shell)))
+        if (_isPwshFamily)
         {
             _tracker.ClearPostPrimary();
             return SerializeResponse(w => w.WriteNull("delta"));
@@ -1615,19 +1637,19 @@ public class ConsoleWorker
         if (_tracker.Busy)
             return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
 
-        var shellName = ConsoleManager.NormalizeShellFamily(_shell);
+        var shellName = _shellFamily;
         var enter = _adapter?.Input.LineEnding
-            ?? ConsoleManager.EnterKeyFor(shellName);
+            ?? _defaultEnter;
 
         // Multi-line pwsh commands have their echo emitted from inside the
         // tempfile itself via [Console]::Write so the child's virtual
         // buffer's cursor tracking stays consistent with what the visible
         // console shows — see BuildMultiLineTempfileBody. Only render the
         // echo directly here for single-line commands.
-        bool isMultiLinePwsh = ConsoleManager.IsPowerShellFamily(shellName) && command.Contains('\n');
+        bool isMultiLinePwsh = _isPwshFamily && command.Contains('\n');
         bool isMultiLineCmd = shellName is "cmd" && command.Contains('\n');
         bool isMultiLinePosix = shellName is "bash" or "sh" or "zsh" && command.Contains('\n');
-        if (ConsoleManager.IsPowerShellFamily(shellName) && !isMultiLinePwsh)
+        if (_isPwshFamily && !isMultiLinePwsh)
             RenderPwshCommandEcho(command);
 
         // Register command with tracker (it will resolve when OSC PromptStart arrives).
@@ -1997,7 +2019,7 @@ public class ConsoleWorker
 
         // Kick the shell to draw a fresh prompt after the banner
         var enter = _adapter?.Input.LineEnding
-            ?? ConsoleManager.EnterKeyFor(ConsoleManager.NormalizeShellFamily(_shell));
+            ?? _defaultEnter;
         try
         {
             var bytes = Encoding.UTF8.GetBytes(enter);

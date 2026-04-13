@@ -1828,31 +1828,6 @@ public class ConsoleManager
         => Path.GetFileNameWithoutExtension(shell).ToLowerInvariant();
 
     /// <summary>
-    /// True for pwsh and powershell.exe (Windows PowerShell 5.1). Both
-    /// share the same integration script, colorizer, -NoExit / -Command
-    /// launch idiom, and set-location preamble syntax, so nearly every
-    /// shell-family check in the worker treats them as one family.
-    /// </summary>
-    internal static bool IsPowerShellFamily(string shellName)
-        => shellName is "pwsh" or "powershell";
-
-    /// <summary>
-    /// True for POSIX-ish shells (bash, sh, zsh) that take `\n` as Enter
-    /// and source an integration.bash / integration.zsh script via PTY
-    /// stdin rather than -Command. cmd and the pwsh family are excluded.
-    /// </summary>
-    internal static bool IsUnixShell(string shellName)
-        => shellName is "bash" or "sh" or "zsh";
-
-    /// <summary>
-    /// The byte sequence the worker writes to the PTY to submit a line of
-    /// input. POSIX shells want LF; pwsh, powershell, and cmd on Windows
-    /// take CR (ConPTY's cooked mode converts back to CRLF internally).
-    /// </summary>
-    internal static string EnterKeyFor(string shellName)
-        => IsUnixShell(shellName) ? "\n" : "\r";
-
-    /// <summary>
     /// True for shells whose cwd format matches what Windows CreateProcess
     /// expects as a workingDirectory parameter — pwsh, powershell and cmd
     /// all report and accept Windows-native paths (`C:\foo`). bash and
