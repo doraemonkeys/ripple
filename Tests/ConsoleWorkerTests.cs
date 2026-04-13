@@ -615,6 +615,31 @@ public class ConsoleWorkerTests
                     $"{profile.label}: multi-line output contains all fragments in order (got: {output.Replace("\n", "\\n")})");
             }
 
+            // bash subshell regression guard. The PS0-based OSC C emission
+            // (replacing the old DEBUG-trap approach) must fire OSC C in the
+            // PARENT shell before the subshell forks, so output captured
+            // inside `(...)` lands in the AI command slice. Without this the
+            // command either hangs forever waiting for a missing OSC D or
+            // resolves with empty output.
+            if (profile.label == "bash")
+            {
+                var resp = await SendRequest(pipeName,
+                    w => { w.WriteString("type", "execute"); w.WriteString("command", "(echo bash-sub-foo; echo bash-sub-bar)"); w.WriteNumber("timeout", 10000); },
+                    TimeSpan.FromSeconds(15));
+                var output = resp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "";
+                var timedOut = resp.TryGetProperty("timedOut", out var t) && t.GetBoolean();
+                Assert(!timedOut, "bash: subshell did not time out");
+                Assert(output.Contains("bash-sub-foo") && output.Contains("bash-sub-bar"),
+                    $"bash: subshell output captured (got: {output.Replace("\n", "\\n")})");
+
+                // Subshell with non-zero exit must propagate to the AI tracker.
+                var exitResp = await SendRequest(pipeName,
+                    w => { w.WriteString("type", "execute"); w.WriteString("command", "(exit 17)"); w.WriteNumber("timeout", 10000); },
+                    TimeSpan.FromSeconds(15));
+                var exitCode = exitResp.TryGetProperty("exitCode", out var e) ? e.GetInt32() : -1;
+                Assert(exitCode == 17, $"bash: subshell exit code propagated (got: {exitCode})");
+            }
+
             // After commands finish, the worker goes back to standby.
             {
                 var resp = await SendRequest(pipeName, w => w.WriteString("type", "get_status"));

@@ -11,23 +11,21 @@ __SPLASHSHELL_INJECTED=1
 # Save original PROMPT_COMMAND
 __sp_original_prompt_command="$PROMPT_COMMAND"
 
-# Track state
-__sp_in_command=0
-
 # Emit OSC 633 sequence: \e]633;{code}[;{data}]\a
 __sp_osc() {
     printf '\e]633;%s\a' "$1"
 }
 
-# Precmd: runs before each prompt
+# Precmd: runs before each prompt via PROMPT_COMMAND. Emits OSC 633 D
+# (CommandFinished with exit code), P (cwd), A (PromptStart) so the
+# proxy tracker can close out the command just resolved. OSC D fires
+# unconditionally — even if no command ran this cycle (empty Enter,
+# Ctrl+C at idle prompt), the tracker's _commandStart gate will keep
+# stray emissions from spuriously resolving.
 __sp_precmd() {
     local exit_code=$?
 
-    if [[ "$__sp_in_command" == "1" ]]; then
-        __sp_osc "D;$exit_code"
-        __sp_in_command=0
-    fi
-
+    __sp_osc "D;$exit_code"
     __sp_osc "P;Cwd=$(pwd)"
     __sp_osc "A"
 
@@ -36,28 +34,32 @@ __sp_precmd() {
     fi
 }
 
-# Preexec: runs after prompt, before command execution (via DEBUG trap).
-# DEBUG fires for every BASH_COMMAND including sub-commands inside a
-# pipeline / sequence / function / sourced script — but the OSC 633
-# protocol expects exactly one C per "command line submit" so the proxy
-# tracker can mark the command-start position once and capture the entire
-# block. Gate on __sp_in_command so subsequent sub-command DEBUG calls in
-# the same line are no-ops; __sp_precmd resets the flag at the next prompt.
-__sp_preexec() {
-    if [[ "$BASH_COMMAND" == "__sp_precmd" ]] || \
-       [[ "$BASH_COMMAND" == "${PROMPT_COMMAND}"* ]]; then
-        return
-    fi
+# PS0 is expanded and printed by bash AFTER reading the full command
+# line and BEFORE it starts executing any part of it — even for
+# subshells, pipelines, compound commands, or multi-statement lines.
+# That's exactly when we want OSC 633 C to fire: once per submission,
+# in the parent shell, so the proxy tracker's _commandStart marks the
+# boundary between input echo and real command output.
+#
+# Using PS0 replaces the old DEBUG-trap / preexec approach, which had
+# two subtle failure modes:
+#
+#   1. DEBUG didn't fire for compound commands in the parent (only for
+#      simple commands inside subshells, and only with `set -T`), so
+#      `(echo foo)` left the parent's state un-flipped and resolve
+#      never fired.
+#   2. Even with `set -T`, inner `__sp_osc` calls inside PROMPT_COMMAND
+#      themselves fired DEBUG and caused spurious OSC C emissions mid-
+#      precmd, scrambling the output slice.
+#
+# PS0 is a single expansion-time hook with no recursion risk and no
+# subshell visibility issues.
+PS0=$'\e]633;C\a'
 
-    if [[ "$__sp_in_command" != "1" ]]; then
-        __sp_osc "C"
-        __sp_in_command=1
-    fi
-}
-
-# Install hooks
 PROMPT_COMMAND="__sp_precmd"
-trap '__sp_preexec' DEBUG
 
-# Initial marker
+# Initial marker — emitted once at integration load so the proxy tracker
+# can distinguish "shell still starting up" from "shell ready for the
+# first user command". The initial OSC A from __sp_precmd's first prompt
+# cycle flips the tracker's _shellReady flag.
 __sp_osc "B"
