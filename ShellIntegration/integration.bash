@@ -1,12 +1,12 @@
-# splashshell shell integration for bash
+# splash shell integration for bash
 # Injects OSC 633 escape sequences for command lifecycle tracking.
-# Sourced automatically by splashshell console worker.
+# Sourced automatically by splash console worker.
 
 # Guard against double-sourcing
-if [[ "$__SPLASHSHELL_INJECTED" == "1" ]]; then
+if [[ "$__SPLASH_INJECTED" == "1" ]]; then
     return
 fi
-__SPLASHSHELL_INJECTED=1
+__SPLASH_INJECTED=1
 
 # Save original PROMPT_COMMAND
 __sp_original_prompt_command="$PROMPT_COMMAND"

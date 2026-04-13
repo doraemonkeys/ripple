@@ -2,9 +2,9 @@ using System.Diagnostics;
 using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
-using SplashShell.Services;
+using Splash.Services;
 
-namespace SplashShell.Tests;
+namespace Splash.Tests;
 
 /// <summary>
 /// E2E test: launch ConsoleWorker in --console mode, send commands via Named Pipe.
@@ -76,7 +76,7 @@ public class ConsoleWorkerTests
 
         Console.WriteLine("=== ConsoleWorker E2E Tests ===");
 
-        // Find splashshell executable
+        // Find splash executable
         var exePath = Process.GetCurrentProcess().MainModule?.FileName;
         if (exePath == null)
         {
@@ -126,7 +126,7 @@ public class ConsoleWorkerTests
 
         // Test 3: execute simple command
         {
-            var command = OperatingSystem.IsWindows() ? "Write-Output 'hello splashshell'" : "echo 'hello splashshell'";
+            var command = OperatingSystem.IsWindows() ? "Write-Output 'hello splash'" : "echo 'hello splash'";
             Console.WriteLine($"  Executing: {command}");
             var resp = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", command); w.WriteNumber("timeout", 10000); }, TimeSpan.FromSeconds(15));
 
@@ -139,7 +139,7 @@ public class ConsoleWorkerTests
             Console.WriteLine($"  ExitCode: {exitCode}, TimedOut: {timedOut}, Cwd: {cwdResult}");
 
             Assert(!timedOut, "Command did not time out");
-            Assert(output.Contains("hello splashshell"), "Output contains expected text");
+            Assert(output.Contains("hello splash"), "Output contains expected text");
             Assert(exitCode == 0, "Exit code is 0");
             Assert(cwdResult != null, "Cwd is reported");
         }
@@ -168,7 +168,7 @@ public class ConsoleWorkerTests
         }
 
         // Test 6: session persistence — a variable set in one execute is readable in the next.
-        // This guards the core value proposition of splashshell: persistent shell state across
+        // This guards the core value proposition of splash: persistent shell state across
         // AI tool calls. If the worker ever loses state (e.g. spawns a subshell per execute),
         // this test catches it immediately.
         {
@@ -331,7 +331,7 @@ public class ConsoleWorkerTests
 
     /// <summary>
     /// Cross-shell smoke test. The main <see cref="Run"/> suite only covers pwsh
-    /// because that's splashshell's primary target; this runs a smaller set of
+    /// because that's splash's primary target; this runs a smaller set of
     /// assertions against Windows PowerShell 5.1 (powershell.exe) and cmd.exe so
     /// both are exercised end-to-end from the Pipe protocol.
     ///
@@ -443,7 +443,7 @@ public class ConsoleWorkerTests
 
         // Read the embedded integration script the same way ConsoleWorker does.
         string? scriptBody;
-        using (var stream = typeof(ConsoleWorker).Assembly.GetManifestResourceStream("SplashShell.ShellIntegration.integration.ps1"))
+        using (var stream = typeof(ConsoleWorker).Assembly.GetManifestResourceStream("Splash.ShellIntegration.integration.ps1"))
         {
             if (stream == null)
             {

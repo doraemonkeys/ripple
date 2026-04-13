@@ -1,6 +1,6 @@
-using SplashShell.Services;
+using Splash.Services;
 
-namespace SplashShell.Tests;
+namespace Splash.Tests;
 
 /// <summary>
 /// Unit tests for CommandTracker.Busy semantics — in particular, that user-initiated

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Release-publish splashshell (NativeAOT) and deploy to npm/dist.
+    Release-publish splash (NativeAOT) and deploy to npm/dist.
 .DESCRIPTION
     Stops any running splash.exe, runs `dotnet publish -c Release` (NativeAOT
     single native exe into ./dist), and mirrors the resulting binary to
@@ -15,11 +15,11 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $ProjectRoot = $PSScriptRoot
-$ProjectFile = Join-Path $ProjectRoot 'splashshell.csproj'
+$ProjectFile = Join-Path $ProjectRoot 'splash.csproj'
 $DistDir = Join-Path $ProjectRoot 'dist'
 $NpmDistDir = Join-Path $ProjectRoot 'npm\dist'
 
-Write-Host '=== splashshell Release Publish ===' -ForegroundColor Cyan
+Write-Host '=== splash Release Publish ===' -ForegroundColor Cyan
 
 Write-Host "`n[1/3] Stopping running splash.exe processes..." -ForegroundColor Yellow
 $processes = @(Get-Process -Name 'splash' -ErrorAction Ignore)

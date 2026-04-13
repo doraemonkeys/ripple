@@ -1,4 +1,4 @@
-# SplashShell
+# splash
 
 <div align="center">
   <img src="https://github.com/user-attachments/assets/1343f694-1c05-4899-9faa-d2b1138aa3ba" alt="social-image" width="640" />
@@ -11,7 +11,7 @@
 Prerequisite: [.NET 9 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/9.0). No global install needed — `npx` fetches a ~5 MB native binary on first run.
 
 ```bash
-claude mcp add-json splash -s user '{"command":"npx","args":["-y","splashshell@latest"]}'
+claude mcp add-json splash -s user '{"command":"npx","args":["-y","@ytsuda/splash@latest"]}'
 ```
 
 <details>
@@ -24,7 +24,7 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
   "mcpServers": {
     "splash": {
       "command": "npx",
-      "args": ["-y", "splashshell@latest"]
+      "args": ["-y", "@ytsuda/splash@latest"]
     }
   }
 }
@@ -34,16 +34,16 @@ The `@latest` tag is important: without it, npx will happily keep reusing a stal
 
 </details>
 
-## Why SplashShell?
+## Why splash?
 
-Other shell MCP servers are either **stateless** (fresh subshell per command, nothing persists) or **headless** (persistent PTY, but invisible to you). SplashShell is neither — and that unlocks things the others can't do.
+Other shell MCP servers are either **stateless** (fresh subshell per command, nothing persists) or **headless** (persistent PTY, but invisible to you). splash is neither — and that unlocks things the others can't do.
 
 ### PowerShell becomes a first-class AI environment
 
 Session persistence helps every shell, but for **PowerShell it's transformative**. Most MCP shell servers spin up a fresh subshell per command — which makes real PowerShell workflows impractical:
 
 - **10,000+ modules on [PowerShell Gallery](https://www.powershellgallery.com/).** Az (Azure), AWS.Tools, Microsoft.Graph (Entra ID / M365), ExchangeOnlineManagement, PnP.PowerShell, SqlServer, ActiveDirectory — plus every CLI in PATH (git, docker, kubectl, terraform, gh, az, aws, gcloud) and full access to .NET types.
-- **30–70 second cold imports, paid once.** `Import-Module Az.Compute, Az.Storage, Az.Network` can take over a minute on the first call. A subshell-per-command MCP server pays that cost on *every* command and the AI gives up on Azure workflows entirely. With SplashShell, the AI imports once and every subsequent cmdlet runs in milliseconds.
+- **30–70 second cold imports, paid once.** `Import-Module Az.Compute, Az.Storage, Az.Network` can take over a minute on the first call. A subshell-per-command MCP server pays that cost on *every* command and the AI gives up on Azure workflows entirely. With splash, the AI imports once and every subsequent cmdlet runs in milliseconds.
 - **Live .NET object graphs.** PowerShell pipes rich objects, not text. After `$vms = Get-AzVM -Status`, the AI can chain arbitrary follow-ups against the live object — filter, group, drill into nested properties — without re-hitting Azure. In a one-shot MCP server, that object vanishes the moment the command returns.
 - **Interactive build-up of complex work.** Set a variable, inspect it, reshape it, feed it back into the next cmdlet. Build a multi-step workflow one command at a time with every previous step's result still in scope.
 
@@ -59,11 +59,11 @@ $vms | Where-Object PowerState -eq "VM running" |
     Group-Object Location | Sort-Object Count -Descending
 ```
 
-PowerShell on SplashShell is the difference between **"AI can answer one-off questions"** and **"AI can do real infrastructure work."** bash and cmd are fully supported too, but pwsh is where SplashShell shines.
+PowerShell on splash is the difference between **"AI can answer one-off questions"** and **"AI can do real infrastructure work."** bash and cmd are fully supported too, but pwsh is where splash shines.
 
 ### Full transparency, in both directions
 
-SplashShell opens a **real, visible terminal window**. You see every AI command as it runs — same characters, same output, same prompt — and you can type into the same window yourself at any time. When a command hangs on an interactive prompt, stalls in watch mode, or just needs a Ctrl+C, the AI can read what's currently on the screen and send keystrokes (Enter, y/n, arrow keys, Ctrl+C) back to the running command — diagnosing and responding without human intervention.
+splash opens a **real, visible terminal window**. You see every AI command as it runs — same characters, same output, same prompt — and you can type into the same window yourself at any time. When a command hangs on an interactive prompt, stalls in watch mode, or just needs a Ctrl+C, the AI can read what's currently on the screen and send keystrokes (Enter, y/n, arrow keys, Ctrl+C) back to the running command — diagnosing and responding without human intervention.
 
 ## Tools
 
@@ -91,7 +91,7 @@ Status lines include console name, shell family, exit code, duration, and cwd:
 - **Sub-agent isolation** — parallel AI agents each get their own consoles so they don't clobber each other's shells.
 - **Cwd drift detection** — manual `cd` in the terminal is detected and the AI is warned before it runs the wrong command in the wrong place.
 
-> **Architecture diagram, full routing matrix, and source**: see [yotsuda/SplashShell](https://github.com/yotsuda/SplashShell#readme).
+> **Architecture diagram, full routing matrix, and source**: see [yotsuda/splash](https://github.com/yotsuda/splash#readme).
 
 ## Platform support
 
@@ -104,4 +104,4 @@ Status lines include console name, shell family, exit code, duration, and cwd:
 
 ## License
 
-MIT. Full release notes and source at [yotsuda/SplashShell](https://github.com/yotsuda/SplashShell).
+MIT. Full release notes and source at [yotsuda/splash](https://github.com/yotsuda/splash).

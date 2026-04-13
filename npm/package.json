@@ -1,14 +1,14 @@
 {
-  "name": "splashshell",
+  "name": "@ytsuda/splash",
   "version": "0.5.0",
   "description": "Shared console MCP server for any shell (bash, pwsh, cmd) — AI and user work in the same terminal. Real-time command visibility, interactive prompt support, session persistence, multi-shell management with automatic cwd handoff.",
   "license": "MIT",
   "author": "Yoshifumi Tsuda",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yotsuda/SplashShell.git"
+    "url": "git+https://github.com/yotsuda/splash.git"
   },
-  "homepage": "https://github.com/yotsuda/SplashShell",
+  "homepage": "https://github.com/yotsuda/splash",
   "keywords": [
     "mcp",
     "mcp-server",

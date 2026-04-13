@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
-namespace SplashShell.Services;
+namespace Splash.Services;
 
 /// <summary>
 /// Manages shell console processes via Named Pipe discovery.
@@ -38,8 +38,8 @@ public class ConsoleManager
         (typeof(ConsoleManager).Assembly.GetName().Version ?? new Version(0, 0)).ToString(3);
 
     // Shared memory for category allocation (same pattern as PowerShell.MCP)
-    private static readonly string SharedMemoryFile = Path.Combine(Path.GetTempPath(), "SplashShell.AllocatedConsoleCategories.dat");
-    private const string MutexName = "SplashShell.AllocatedConsoleCategories";
+    private static readonly string SharedMemoryFile = Path.Combine(Path.GetTempPath(), "Splash.AllocatedConsoleCategories.dat");
+    private const string MutexName = "Splash.AllocatedConsoleCategories";
     private const int MaxEntries = 64;
     private const int EntrySize = 8;        // 4 bytes PID + 4 bytes category index
     private const int HeaderSize = 8;       // 4 bytes magic + 4 bytes count
@@ -1574,7 +1574,7 @@ public class ConsoleManager
     // --- Pipe enumeration ---
 
     /// <summary>
-    /// Enumerates splashshell Named Pipes.
+    /// Enumerates splash Named Pipes.
     /// Windows: \\.\pipe\SP.*
     /// Linux/macOS: /tmp/CoreFxPipe_SP.*
     /// </summary>

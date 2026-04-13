@@ -2,7 +2,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
 
-namespace SplashShell.Services;
+namespace Splash.Services;
 
 /// <summary>
 /// Tracks command lifecycle using OSC 633 events.

@@ -3,7 +3,7 @@ using System.ComponentModel;
 using System.Text;
 using System.Text.RegularExpressions;
 
-namespace SplashShell.Tools;
+namespace Splash.Tools;
 
 /// <summary>
 /// File operation tools — compatible with Claude Code's built-in tools.

@@ -1,6 +1,6 @@
-using SplashShell.Services;
+using Splash.Services;
 
-namespace SplashShell.Tests;
+namespace Splash.Tests;
 
 public class OscParserTests
 {

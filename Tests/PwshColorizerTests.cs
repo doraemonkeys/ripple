@@ -1,6 +1,6 @@
-using SplashShell.Services;
+using Splash.Services;
 
-namespace SplashShell.Tests;
+namespace Splash.Tests;
 
 /// <summary>
 /// Sanity tests for PwshColorizer — checks that common syntax elements are

@@ -1,11 +1,11 @@
-# splashshell shell integration for zsh
+# splash shell integration for zsh
 # Injects OSC 633 escape sequences for command lifecycle tracking.
-# Sourced automatically by splashshell console worker.
+# Sourced automatically by splash console worker.
 
-if [[ "$__SPLASHSHELL_INJECTED" == "1" ]]; then
+if [[ "$__SPLASH_INJECTED" == "1" ]]; then
     return
 fi
-__SPLASHSHELL_INJECTED=1
+__SPLASH_INJECTED=1
 
 __sp_osc() {
     printf '\e]633;%s\a' "$1"

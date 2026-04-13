@@ -1,12 +1,12 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using static SplashShell.Services.Win32Native;
+using static Splash.Services.Win32Native;
 
-namespace SplashShell.Services;
+namespace Splash.Services;
 
 /// <summary>
-/// Launches splashshell console worker processes with clean environment.
+/// Launches splash console worker processes with clean environment.
 /// Uses Win32 CreateProcessW + CreateEnvironmentBlock (bInherit=false) to ensure
 /// the child process does NOT inherit the MCP server's environment variables.
 /// Equivalent to PowerShell.MCP's PwshLauncherWindows pattern.
@@ -58,7 +58,7 @@ public class ProcessLauncher
     private const uint CREATE_NEW_CONSOLE = 0x00000010;
 
     /// <summary>
-    /// Launch a splashshell console worker (--console mode) with clean environment.
+    /// Launch a splash console worker (--console mode) with clean environment.
     /// The worker creates a PTY (ConPTY on Windows, forkpty on Linux/macOS),
     /// launches the shell, and serves commands via Named Pipe.
     ///
@@ -68,7 +68,7 @@ public class ProcessLauncher
     public int LaunchConsoleWorker(int proxyPid, string agentId, string shell, string? workingDirectory = null, string? banner = null, string? reason = null)
     {
         var exePath = Process.GetCurrentProcess().MainModule?.FileName
-            ?? throw new InvalidOperationException("Cannot determine splashshell executable path");
+            ?? throw new InvalidOperationException("Cannot determine splash executable path");
 
         var cwd = workingDirectory ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 

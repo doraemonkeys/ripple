@@ -1,4 +1,4 @@
-namespace SplashShell.Services;
+namespace Splash.Services;
 
 /// <summary>
 /// OSC 633 parser — extracts shell integration sequences from PTY output stream.

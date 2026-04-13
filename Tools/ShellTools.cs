@@ -1,9 +1,9 @@
 using ModelContextProtocol.Server;
 using System.ComponentModel;
 using System.Text;
-using SplashShell.Services;
+using Splash.Services;
 
-namespace SplashShell.Tools;
+namespace Splash.Tools;
 
 [McpServerToolType]
 public class ShellTools

@@ -1,6 +1,6 @@
 using System.Text;
 
-namespace SplashShell.Services;
+namespace Splash.Services;
 
 /// <summary>
 /// Lightweight PowerShell syntax colorizer used to paint AI-entered commands

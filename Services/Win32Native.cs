@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace SplashShell.Services;
+namespace Splash.Services;
 
 /// <summary>
 /// Shared Win32 P/Invoke declarations used by ConPty, ProcessLauncher, and ConsoleWorker.
