@@ -196,6 +196,20 @@ Window titles use the format `#PID Name` (e.g., `#12345 Sapphire`) so you can id
 - **Windows**: ConPTY + Named Pipe (primary target, fully tested)
 - **Linux/macOS**: Unix PTY fallback (experimental)
 
+## Known limitations
+
+### cmd.exe exit codes are always reported as 0
+
+cmd.exe's `PROMPT` variable can't expand `%ERRORLEVEL%` at display time (it's a static template, not a script), so splash's shell integration falls back to emitting a fake `OSC 633;D;0` marker on every prompt. AI-initiated cmd commands therefore show as `Finished (exit code unavailable)` in the status line — the literal exit code is unobtainable. Use `pwsh` or `bash` if you need exit-code-aware execution. (The visible terminal still has the real `%ERRORLEVEL%`; only the AI-side capture is affected.)
+
+### Don't `Remove-Module PSReadLine` inside a splash pwsh session
+
+Splash's pwsh integration relies on PSReadLine's input loop. Running `Remove-Module PSReadLine -Force` mid-session strands PSReadLine's background reader threads — they keep consuming console input bytes after the module unregisters its cmdlets, so pwsh's fallback `ReadConsoleW` never sees the AI's next command and the session hangs indefinitely.
+
+This is a structural problem (PSReadLine spawns persistent reader threads, .NET can't fully unload binary modules, and there's no way to kill the orphaned threads from outside the process). Splash can't recover from it.
+
+If your workflow needs a pwsh session without PSReadLine, start a fresh console and avoid loading PSReadLine — splash's integration script tolerates a missing module at startup.
+
 ## How it works
 
 splashshell runs as a stdio MCP server. When the AI calls `start_console`, splashshell spawns itself in `--console` mode as a ConPTY worker, which hosts the actual shell (cmd.exe, pwsh.exe, bash.exe, etc.) inside a real Windows console window. The parent process streams stdin/stdout over a named pipe, injects shell integration scripts (`ShellIntegration/integration.*`) to emit OSC 633 markers, and parses those markers to delimit command output, track cwd, and capture exit codes.
