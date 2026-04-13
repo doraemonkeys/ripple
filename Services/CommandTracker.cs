@@ -12,7 +12,9 @@ namespace Splash.Services;
 ///   RegisterCommand() → command written to PTY →
 ///   OSC C (CommandExecuted) → output captured →
 ///   OSC D;{exitCode} (CommandFinished) → OSC P;Cwd=... → OSC A (PromptStart) →
-///   settle timer (150ms) → resolve with { output, exitCode, cwd }
+///   Resolve() with { output, exitCode, cwd } → proxy drains post-primary
+///   buffer via WaitAndDrainPostOutputAsync (stable_ms comes from the
+///   adapter's output.post_prompt_settle_ms)
 ///
 /// On timeout: caller's Task is cancelled, but output capture continues.
 /// When the shell eventually completes, the result is cached for WaitForCompletion.

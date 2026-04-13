@@ -4,6 +4,7 @@ using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using Splash.Services.Adapters;
 
 namespace Splash.Services;
 
@@ -683,13 +684,26 @@ public class ConsoleManager
             // for stable_ms, capped at max_ms. Fast commands return in ~100ms,
             // slow streaming waits as long as needed up to max_ms. Runs on
             // the second pipe instance since the execute call freed the first.
+            //
+            // Milestone 2g: stable_ms is sourced from the adapter's
+            // output.post_prompt_settle_ms when a YAML adapter is loaded for
+            // the console's shell family, else 100. max_ms is scaled so it
+            // always has at least 200ms of headroom above stable_ms, so
+            // settle windows wider than the old 500ms ceiling (e.g. cmd's
+            // 400ms) still get a chance to complete.
             try
             {
+                var info = _consoles.GetValueOrDefault(consolePid);
+                var drainAdapter = info != null
+                    ? AdapterRegistry.Default?.Find(info.ShellFamily)
+                    : null;
+                int stableMs = drainAdapter?.Output.PostPromptSettleMs ?? 100;
+                int maxMs = Math.Max(500, stableMs + 200);
                 var drainResp = await SendPipeRequestAsync(pipeName, w =>
                 {
                     w.WriteString("type", "drain_post_output");
-                    w.WriteNumber("stable_ms", 100);
-                    w.WriteNumber("max_ms", 500);
+                    w.WriteNumber("stable_ms", stableMs);
+                    w.WriteNumber("max_ms", maxMs);
                 }, TimeSpan.FromSeconds(2));
 
                 var delta = drainResp.TryGetProperty("delta", out var dp) ? dp.GetString() : null;
