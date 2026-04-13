@@ -36,6 +36,7 @@ public class Program
             {
                 await Tests.ConsoleWorkerTests.Run();
                 await Tests.ConsoleWorkerTests.RunMultiShell();
+                await Tests.ConsoleWorkerTests.RunIntegrationScriptGuardTest();
             }
             return;
         }

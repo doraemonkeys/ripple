@@ -396,6 +396,83 @@ public class ConsoleWorkerTests
         if (totalFail > 0) Environment.Exit(1);
     }
 
+    /// <summary>
+    /// Verify integration.ps1 doesn't crash when PSReadLine isn't loaded.
+    /// Spawns a fresh pwsh, removes PSReadLine, then dot-sources the
+    /// embedded integration script. The script has best-effort guards
+    /// around its PSReadLine cmdlets — if they regress, this test catches
+    /// it before it becomes a worker-startup hang.
+    /// </summary>
+    public static async Task RunIntegrationScriptGuardTest()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.WriteLine("=== ConsoleWorker PSReadLine Guard Test === SKIP (Windows-only)");
+            return;
+        }
+
+        Console.WriteLine("=== ConsoleWorker PSReadLine Guard Test ===");
+        var pass = 0;
+        var fail = 0;
+        void Assert(bool condition, string name)
+        {
+            if (condition) { pass++; Console.WriteLine($"  PASS: {name}"); }
+            else { fail++; Console.Error.WriteLine($"  FAIL: {name}"); }
+        }
+
+        // Read the embedded integration script the same way ConsoleWorker does.
+        string? scriptBody;
+        using (var stream = typeof(ConsoleWorker).Assembly.GetManifestResourceStream("SplashShell.ShellIntegration.integration.ps1"))
+        {
+            if (stream == null)
+            {
+                Assert(false, "integration.ps1 embedded resource located");
+                Console.WriteLine($"\n{pass} passed, {fail} failed");
+                if (fail > 0) Environment.Exit(1);
+                return;
+            }
+            using var reader = new StreamReader(stream);
+            scriptBody = reader.ReadToEnd();
+        }
+        Assert(true, "integration.ps1 embedded resource located");
+
+        var tmp = Path.Combine(Path.GetTempPath(), $"splash-psrl-guard-{Guid.NewGuid():N}.ps1");
+        await File.WriteAllTextAsync(tmp, scriptBody);
+
+        try
+        {
+            // Run pwsh with PSReadLine forcibly removed, then source the
+            // integration. Exit 0 + empty stderr = clean load.
+            var psi = new ProcessStartInfo
+            {
+                FileName = "pwsh.exe",
+                Arguments = $"-NoProfile -NonInteractive -Command \"$ErrorActionPreference='Stop'; Remove-Module PSReadLine -ErrorAction Ignore; . '{tmp}'; exit 0\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            using var proc = Process.Start(psi);
+            if (proc == null)
+            {
+                Assert(false, "pwsh.exe started");
+                return;
+            }
+            var stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+
+            Assert(proc.ExitCode == 0, $"integration loads cleanly without PSReadLine (exit={proc.ExitCode}, stderr={stderr.Trim().Replace("\n", "\\n")})");
+            Assert(string.IsNullOrWhiteSpace(stderr), $"no stderr noise from integration load (got: {stderr.Trim().Replace("\n", "\\n")})");
+        }
+        finally
+        {
+            try { File.Delete(tmp); } catch { }
+        }
+
+        Console.WriteLine($"\n{pass} passed, {fail} failed");
+        if (fail > 0) Environment.Exit(1);
+    }
+
     private record ShellProfile(
         string label,
         string shellExe,

@@ -86,26 +86,42 @@ $ExecutionContext.InvokeCommand.PreCommandLookupAction = {
 # will).
 Write-Host -NoNewline (__sp_osc_str "B")
 
-# Override Enter to emit OSC B and arm the "next command lookup is a user
-# command" flag. The actual OSC C fires from PreCommandLookupAction a moment
-# later, right before the command runs — by then PSReadLine's AcceptLine has
-# finalized the visible line and we're out of the input-rendering noise.
-Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
-    Write-Host -NoNewline (__sp_osc_str "B")
-    $global:__sp_pending_user_command = $true
-    [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
-}
+# PSReadLine integrations — best-effort. PSReadLine is normally loaded in
+# interactive pwsh (splash's launch line also calls Import-Module on it),
+# but a screen-reader fallback or an explicit Remove-Module would leave the
+# cmdlets undefined. Guard with Get-Module so the integration script stops
+# cleanly instead of throwing CommandNotFoundException, which would crash
+# the worker mid-startup. Without these handlers the AI command tracker
+# stops getting OSC B (user-busy detection) and the tempfile dot-source
+# lines leak into history — both observability concerns, not correctness.
+if (Get-Module PSReadLine) {
+    # Override Enter to emit OSC B and arm the "next command lookup is a
+    # user command" flag. The actual OSC C fires from PreCommandLookupAction
+    # a moment later, right before the command runs — by then PSReadLine's
+    # AcceptLine has finalized the visible line and we're out of the input-
+    # rendering noise.
+    try {
+        Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+            Write-Host -NoNewline (__sp_osc_str "B")
+            $global:__sp_pending_user_command = $true
+            [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+        }
+    } catch { }
 
-# Skip the internal `. 'C:\...\.splash-exec-*.ps1'; Remove-Item ...`
-# dot-source lines that splash uses to run multi-line AI commands. Those
-# are an implementation detail — the user pressing Up to recall history
-# wants to see the real previous commands they typed, not the transient
-# tempfile path, and the scrollback already shows the colorized echo of
-# the actual command body via the tempfile's own output.
-Set-PSReadLineOption -AddToHistoryHandler {
-    param([string]$line)
-    if ($line -match "\.splash-exec-.*\.ps1") {
-        return [Microsoft.PowerShell.AddToHistoryOption]::SkipAdding
-    }
-    return [Microsoft.PowerShell.AddToHistoryOption]::MemoryAndFile
+    # Skip the internal `. 'C:\...\.splash-exec-*.ps1'; Remove-Item ...`
+    # dot-source lines that splash uses to run multi-line AI commands.
+    # Those are an implementation detail — the user pressing Up to recall
+    # history wants to see the real previous commands they typed, not the
+    # transient tempfile path, and the scrollback already shows the
+    # colorized echo of the actual command body via the tempfile's own
+    # output.
+    try {
+        Set-PSReadLineOption -AddToHistoryHandler {
+            param([string]$line)
+            if ($line -match "\.splash-exec-.*\.ps1") {
+                return [Microsoft.PowerShell.AddToHistoryOption]::SkipAdding
+            }
+            return [Microsoft.PowerShell.AddToHistoryOption]::MemoryAndFile
+        }
+    } catch { }
 }
