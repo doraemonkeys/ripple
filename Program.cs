@@ -18,7 +18,7 @@ public class Program
         // registry via AdapterRegistry.Default without plumbing it through
         // constructors. Failures are non-fatal — we log and continue with
         // the existing hardcoded shell paths still intact as fallback.
-        var (registry, adapterReport) = AdapterRegistry.LoadEmbedded();
+        var (registry, adapterReport) = AdapterRegistry.LoadDefault();
         AdapterRegistry.SetDefault(registry);
         bool isWorkerMode = args.Contains("--console");
         if (!isWorkerMode || adapterReport.HasErrors)

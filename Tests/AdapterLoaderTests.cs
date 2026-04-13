@@ -108,6 +108,108 @@ public static class AdapterLoaderTests
         Assert(aliased != null && aliased.Name == "pwsh",
             "alias: 'powershell' resolves to pwsh");
 
+        // External loading: write a YAML to a temp directory and verify
+        // AdapterLoader.LoadFromDirectory picks it up with its
+        // integration_script populated from an inline block.
+        var tempDir = Path.Combine(Path.GetTempPath(), $"splash-adapter-test-{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(tempDir);
+            var testAdapterPath = Path.Combine(tempDir, "testshell.yaml");
+            File.WriteAllText(testAdapterPath, """
+schema: 1
+name: testshell
+version: 0.0.1
+description: ephemeral unit-test adapter
+family: shell
+process:
+  command_template: '"{shell_path}"'
+  inherit_environment: true
+ready:
+  wait_for_event: prompt_start
+init:
+  strategy: none
+  delivery: none
+output:
+  post_prompt_settle_ms: 25
+input:
+  line_ending: "\n"
+signals:
+  interrupt: "\u0003"
+lifecycle:
+  shutdown:
+    command: exit
+capabilities:
+  stateful: true
+integration_script: |
+  # inline integration script body for a test adapter
+  echo 'testshell integration loaded'
+""");
+
+            var extResult = AdapterLoader.LoadFromDirectory(tempDir);
+            Assert(extResult.Errors.Count == 0,
+                $"external: no parse errors (got {extResult.Errors.Count})");
+            Assert(extResult.Adapters.Count == 1,
+                $"external: exactly one adapter loaded (got {extResult.Adapters.Count})");
+            if (extResult.Adapters.Count == 1)
+            {
+                var loaded = extResult.Adapters[0];
+                Assert(loaded.Source == AdapterLoader.AdapterSource.External,
+                    "external: source marked External");
+                Assert(loaded.Origin == testAdapterPath,
+                    $"external: origin is the YAML file path (got {loaded.Origin})");
+                Assert(loaded.Adapter.Name == "testshell",
+                    $"external: adapter name round-trips (got {loaded.Adapter.Name})");
+                Assert(loaded.Adapter.IntegrationScript?.Contains("testshell integration loaded") == true,
+                    "external: inline integration_script block preserved");
+            }
+
+            // File-based script_resource: drop an integration.sh next to
+            // the YAML and reference it from a second adapter.
+            var scriptPath = Path.Combine(tempDir, "integration.testsh");
+            File.WriteAllText(scriptPath, "# file-based external integration script\necho 'loaded from file'\n");
+            var secondAdapterPath = Path.Combine(tempDir, "filebacked.yaml");
+            File.WriteAllText(secondAdapterPath, """
+schema: 1
+name: filebacked
+version: 0.0.1
+description: adapter whose integration script comes from a sibling file
+family: shell
+process:
+  command_template: '"{shell_path}"'
+  inherit_environment: true
+ready:
+  wait_for_event: prompt_start
+init:
+  strategy: shell_integration
+  delivery: pty_inject
+  script_resource: integration.testsh
+output:
+  post_prompt_settle_ms: 25
+input:
+  line_ending: "\n"
+signals:
+  interrupt: "\u0003"
+lifecycle:
+  shutdown:
+    command: exit
+capabilities:
+  stateful: true
+""");
+
+            var extResult2 = AdapterLoader.LoadFromDirectory(tempDir);
+            var filebacked = extResult2.Adapters
+                .FirstOrDefault(a => a.Adapter.Name == "filebacked");
+            Assert(filebacked != null,
+                "external: file-backed adapter parses");
+            Assert(filebacked?.Adapter.IntegrationScript?.Contains("loaded from file") == true,
+                "external: script_resource resolved relative to YAML directory");
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }

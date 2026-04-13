@@ -68,7 +68,7 @@ public static class AdapterLoader
     public static LoadResult LoadEmbedded()
     {
         var assembly = Assembly.GetExecutingAssembly();
-        var adapters = new List<Adapter>();
+        var adapters = new List<LoadedAdapter>();
         var errors = new List<(string Resource, string Error)>();
 
         foreach (var resourceName in assembly.GetManifestResourceNames())
@@ -85,8 +85,8 @@ public static class AdapterLoader
                 using var reader = new StreamReader(stream);
                 var yaml = reader.ReadToEnd();
                 var adapter = Parse(yaml, resourceName);
-                ResolveIntegrationScript(adapter, assembly);
-                adapters.Add(adapter);
+                ResolveIntegrationScript(adapter, assembly, externalDir: null);
+                adapters.Add(new LoadedAdapter(adapter, AdapterSource.Embedded, resourceName));
             }
             catch (Exception ex)
             {
@@ -98,13 +98,61 @@ public static class AdapterLoader
     }
 
     /// <summary>
-    /// Populate adapter.IntegrationScript from an embedded resource named
-    /// by adapter.Init.ScriptResource, unless the YAML already provided
-    /// an inline integration_script block. No-op when neither is set.
-    /// Throws InvalidOperationException if script_resource is set but
-    /// the embedded resource is not found.
+    /// Load all adapter YAMLs directly from a filesystem directory. Used for
+    /// user-contributed adapters under ~/.splash/adapters/ — the user drops
+    /// a YAML there, splash picks it up on the next startup, no rebuild.
+    ///
+    /// Missing directory is a no-op (empty result, no error). Individual
+    /// YAML parse failures are collected per file rather than aborting the
+    /// whole directory, so one broken adapter can't hide a working one.
+    ///
+    /// script_resource is resolved relative to the YAML's own directory
+    /// first (allowing fully self-contained external adapters), falling
+    /// back to the embedded ShellIntegration resources (so an external
+    /// adapter can reference a built-in integration script by name).
     /// </summary>
-    private static void ResolveIntegrationScript(Adapter adapter, Assembly assembly)
+    public static LoadResult LoadFromDirectory(string directory)
+    {
+        var adapters = new List<LoadedAdapter>();
+        var errors = new List<(string Resource, string Error)>();
+
+        if (!Directory.Exists(directory))
+            return new LoadResult(adapters, errors);
+
+        var assembly = Assembly.GetExecutingAssembly();
+
+        foreach (var filePath in Directory.EnumerateFiles(directory, "*.yaml"))
+        {
+            try
+            {
+                var yaml = File.ReadAllText(filePath);
+                var adapter = Parse(yaml, filePath);
+                ResolveIntegrationScript(adapter, assembly, externalDir: directory);
+                adapters.Add(new LoadedAdapter(adapter, AdapterSource.External, filePath));
+            }
+            catch (Exception ex)
+            {
+                errors.Add((filePath, ex.Message));
+            }
+        }
+
+        return new LoadResult(adapters, errors);
+    }
+
+    /// <summary>
+    /// Populate adapter.IntegrationScript. Precedence:
+    ///   1. Inline integration_script: block in the YAML (already set
+    ///      during Parse) → no-op here.
+    ///   2. script_resource: resolved relative to externalDir (for
+    ///      external adapters, enables a self-contained YAML + script
+    ///      pair in ~/.splash/adapters/).
+    ///   3. script_resource: resolved as an embedded resource under
+    ///      Splash.ShellIntegration.* (for external adapters overriding
+    ///      a built-in shell while still using its integration script).
+    /// Throws InvalidOperationException if script_resource is set but
+    /// neither the external file nor the embedded resource exists.
+    /// </summary>
+    private static void ResolveIntegrationScript(Adapter adapter, Assembly assembly, string? externalDir)
     {
         if (!string.IsNullOrEmpty(adapter.IntegrationScript))
             return;
@@ -113,16 +161,36 @@ public static class AdapterLoader
         if (string.IsNullOrEmpty(resourceRef))
             return;
 
+        if (externalDir != null)
+        {
+            var externalPath = Path.Combine(externalDir, resourceRef);
+            if (File.Exists(externalPath))
+            {
+                adapter.IntegrationScript = File.ReadAllText(externalPath);
+                return;
+            }
+        }
+
         var fullResourceName = $"Splash.ShellIntegration.{resourceRef}";
-        using var stream = assembly.GetManifestResourceStream(fullResourceName)
-            ?? throw new InvalidOperationException(
+        using var stream = assembly.GetManifestResourceStream(fullResourceName);
+        if (stream == null)
+        {
+            var externalHint = externalDir != null
+                ? $" (also not found at '{Path.Combine(externalDir, resourceRef)}')"
+                : "";
+            throw new InvalidOperationException(
                 $"Adapter '{adapter.Name}' references script_resource '{resourceRef}' " +
-                $"but embedded resource '{fullResourceName}' was not found.");
+                $"but embedded resource '{fullResourceName}' was not found{externalHint}.");
+        }
         using var reader = new StreamReader(stream);
         adapter.IntegrationScript = reader.ReadToEnd();
     }
 
+    public enum AdapterSource { Embedded, External }
+
+    public record LoadedAdapter(Adapter Adapter, AdapterSource Source, string Origin);
+
     public record LoadResult(
-        IReadOnlyList<Adapter> Adapters,
+        IReadOnlyList<LoadedAdapter> Adapters,
         IReadOnlyList<(string Resource, string Error)> Errors);
 }

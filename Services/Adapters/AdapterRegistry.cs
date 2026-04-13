@@ -28,42 +28,119 @@ public sealed class AdapterRegistry
     }
 
     /// <summary>
-    /// Load all adapters embedded in the splash assembly and build a
-    /// registry. Throws if any adapter name collides with a previously
-    /// registered name or alias. Parse errors for individual adapters are
-    /// surfaced via the returned LoadReport, not thrown.
+    /// Default external adapter directory: ~/.splash/adapters. User-dropped
+    /// YAMLs here override embedded adapters of the same name, so a user
+    /// iterating on a local adapter doesn't need to rebuild splash.
+    /// </summary>
+    public static string DefaultExternalDirectory =>
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".splash",
+            "adapters");
+
+    /// <summary>
+    /// Load all adapters shipped with the splash binary. Parse errors for
+    /// individual adapters are surfaced via the returned LoadReport, not
+    /// thrown.
     /// </summary>
     public static (AdapterRegistry Registry, LoadReport Report) LoadEmbedded()
+        => LoadFrom(AdapterLoader.LoadEmbedded());
+
+    /// <summary>
+    /// Load embedded adapters plus any YAMLs found in the user-scoped
+    /// external adapter directory. External adapters override embedded
+    /// adapters of the same name (users can edit a local pwsh.yaml without
+    /// forking the repo); name clashes among external adapters, or between
+    /// external and embedded aliases, surface as collisions in LoadReport.
+    /// </summary>
+    public static (AdapterRegistry Registry, LoadReport Report) LoadDefault()
     {
-        var loadResult = AdapterLoader.LoadEmbedded();
+        var embedded = AdapterLoader.LoadEmbedded();
+        var external = AdapterLoader.LoadFromDirectory(DefaultExternalDirectory);
+        return LoadFrom(embedded, external);
+    }
+
+    private static (AdapterRegistry Registry, LoadReport Report) LoadFrom(params AdapterLoader.LoadResult[] sources)
+    {
         var byName = new Dictionary<string, Adapter>(StringComparer.OrdinalIgnoreCase);
+        var loadedOrigins = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var collisions = new List<string>();
+        var overrides = new List<string>();
+        var parseErrors = new List<(string Resource, string Error)>();
 
-        foreach (var adapter in loadResult.Adapters)
+        foreach (var source in sources)
         {
-            if (!byName.TryAdd(adapter.Name, adapter))
-            {
-                collisions.Add($"adapter name '{adapter.Name}' is registered by multiple YAML files");
-                continue;
-            }
+            parseErrors.AddRange(source.Errors);
 
-            if (adapter.Aliases != null)
+            foreach (var loaded in source.Adapters)
             {
-                foreach (var alias in adapter.Aliases)
+                var adapter = loaded.Adapter;
+                var originLabel = loaded.Source == AdapterLoader.AdapterSource.External
+                    ? $"external:{Path.GetFileName(loaded.Origin)}"
+                    : $"embedded:{loaded.Origin}";
+
+                // External adapters override embedded ones of the same name
+                // even when the embedded one is already registered under
+                // aliases — the user's intent is "replace the built-in".
+                if (byName.TryGetValue(adapter.Name, out var existing))
                 {
-                    if (!byName.TryAdd(alias, adapter))
-                        collisions.Add($"alias '{alias}' for adapter '{adapter.Name}' collides with existing registration");
+                    var existingOrigin = loadedOrigins.GetValueOrDefault(adapter.Name, "?");
+                    if (loaded.Source == AdapterLoader.AdapterSource.External &&
+                        existingOrigin.StartsWith("embedded:"))
+                    {
+                        RemoveAdapter(byName, loadedOrigins, existing);
+                        overrides.Add($"external adapter '{adapter.Name}' from {loaded.Origin} overrode {existingOrigin}");
+                    }
+                    else
+                    {
+                        collisions.Add($"adapter name '{adapter.Name}' from {originLabel} collides with existing registration ({existingOrigin})");
+                        continue;
+                    }
+                }
+
+                byName[adapter.Name] = adapter;
+                loadedOrigins[adapter.Name] = originLabel;
+
+                if (adapter.Aliases != null)
+                {
+                    foreach (var alias in adapter.Aliases)
+                    {
+                        if (byName.TryGetValue(alias, out var aliasExisting) && !ReferenceEquals(aliasExisting, adapter))
+                        {
+                            collisions.Add($"alias '{alias}' for adapter '{adapter.Name}' ({originLabel}) collides with existing registration ({loadedOrigins.GetValueOrDefault(alias, "?")})");
+                            continue;
+                        }
+                        byName[alias] = adapter;
+                        loadedOrigins[alias] = originLabel;
+                    }
                 }
             }
         }
 
         var registry = new AdapterRegistry(byName);
+        var distinctLoaded = byName.Values.Distinct()
+            .Select(a => $"{a.Name}({loadedOrigins.GetValueOrDefault(a.Name, "?").Split(':')[0]})")
+            .ToList();
         var report = new LoadReport(
-            Loaded: loadResult.Adapters.Select(a => a.Name).ToList(),
-            ParseErrors: loadResult.Errors,
-            Collisions: collisions);
+            Loaded: distinctLoaded,
+            ParseErrors: parseErrors,
+            Collisions: collisions,
+            Overrides: overrides);
 
         return (registry, report);
+    }
+
+    private static void RemoveAdapter(
+        Dictionary<string, Adapter> byName,
+        Dictionary<string, string> origins,
+        Adapter adapter)
+    {
+        var keysToRemove = byName.Where(kv => ReferenceEquals(kv.Value, adapter)).Select(kv => kv.Key).ToList();
+        foreach (var key in keysToRemove)
+        {
+            byName.Remove(key);
+            origins.Remove(key);
+        }
     }
 
     /// <summary>
@@ -80,7 +157,8 @@ public sealed class AdapterRegistry
     public record LoadReport(
         IReadOnlyList<string> Loaded,
         IReadOnlyList<(string Resource, string Error)> ParseErrors,
-        IReadOnlyList<string> Collisions)
+        IReadOnlyList<string> Collisions,
+        IReadOnlyList<string> Overrides)
     {
         public bool HasErrors => ParseErrors.Count > 0 || Collisions.Count > 0;
 
@@ -90,6 +168,8 @@ public sealed class AdapterRegistry
             {
                 $"{Loaded.Count} loaded ({string.Join(", ", Loaded)})"
             };
+            if (Overrides.Count > 0)
+                parts.Add($"{Overrides.Count} override(s): {string.Join("; ", Overrides)}");
             if (ParseErrors.Count > 0)
                 parts.Add($"{ParseErrors.Count} parse error(s): {string.Join("; ", ParseErrors.Select(e => $"{e.Resource}: {e.Error}"))}");
             if (Collisions.Count > 0)
