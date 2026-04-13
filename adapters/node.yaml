@@ -1,0 +1,134 @@
+﻿schema: 1
+name: node
+version: 0.1.0
+description: >
+  Node.js interactive REPL with OSC 633 shell-integration-style command
+  tracking. Unlike Python, Node has no `-i script.js` flag, so the
+  launch convention is to pass an integration script that calls
+  repl.start() and customises displayPrompt to inject OSC bytes into
+  the prompt string at each command boundary. Multi-line commands are
+  delivered via the same tempfile path Python uses, with a server.eval
+  helper that handles const/let/class scoping correctly.
+homepage: https://github.com/yotsuda/splash
+license: MIT
+family: repl
+aliases:
+  - nodejs
+  - node.exe
+
+process:
+  # `node {tempfile}` runs the integration script which calls
+  # repl.start() and stays interactive until the REPL is exited.
+  command_template: '"{shell_path}" {init_invocation}'
+  inherit_environment: true
+  env:
+    # Quiet Node's experimental warnings so the OSC pipeline stays
+    # clean and splash's input-echo stripper doesn't have surprise
+    # diagnostic noise to deal with.
+    NODE_NO_WARNINGS: "1"
+  encoding: utf-8
+  # Node's REPL on Windows reads stdin via readline and treats CR as
+  # Enter (same as Python and unlike bash). \n alone is consumed as
+  # whitespace and never submits the line.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  delay_after_inject_ms: 0
+
+init:
+  strategy: shell_integration
+  hook_type: prompt_variable        # displayPrompt + setPrompt swap
+  delivery: launch_command
+  tempfile:
+    prefix: .splash-integration-
+    extension: .js
+  init_invocation_template: '"{tempfile_path}"'
+  script_resource: integration.js
+
+prompt:
+  strategy: shell_integration
+  shell_integration:
+    protocol: osc633
+    markers:
+      prompt_start: "A"
+      command_finished: "D"
+      property_update: "P"
+    property_updates:
+      cwd_key: Cwd
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  strip_input_echo: true
+  # Node's REPL doesn't have a stdlib pre-input hook to fire OSC B/C
+  # before user input is read, so we strip the input echo
+  # deterministically the same way cmd.exe and Python do.
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  multiline_detect: none
+  # Multi-line bodies are written to a .splash-exec-*.js tempfile and
+  # invoked via the async _splash_exec_file helper. The `await` in the
+  # invocation pauses the REPL on the returned Promise so server.eval
+  # can finish before splash's tracker resolves on the next prompt —
+  # without it, the tracker would race the eval callback.
+  multiline_delivery: tempfile
+  tempfile:
+    prefix: .splash-exec-
+    extension: .js
+    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.js"
+    invocation_template: 'await _splash_exec_file(String.raw`{path}`)'
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: ".exit"
+    grace_ms: 1000
+    force_signal: kill
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: true   # Node REPL has .help / .editor / .exit / .load
+  async_output: false
+  exit_code: "unreliable"
+  cwd_tracking: true
+  job_control: false
+  shell_integration: osc633
+  user_busy_detection: none
+
+probe:
+  eval: "1 + 1"
+  expect: '^2$'
+
+tests:
+  - name: "integer arithmetic"
+    eval: "21 * 2"
+    expect: '42'
+
+  - name: "stateful: var persists across commands"
+    setup_sequence:
+      - eval: "global.SPLASH_TEST = 'persist-ok'"
+    eval: "global.SPLASH_TEST"
+    expect: 'persist-ok'
+
+  - name: "top-level await resolves"
+    eval: "await Promise.resolve(99)"
+    expect: '99'
+
+  - name: "exception: thrown error reaches the next prompt"
+    eval: "throw new Error('boom')"
+    expect: 'boom'
+    exit_code_is_unreliable: true
