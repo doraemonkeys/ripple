@@ -2,6 +2,33 @@
 
 All notable changes to splashshell are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-04-13
+
+A round of cmd.exe and bash polish driven by systematic shell-by-shell testing. cmd is now usable for AI commands instead of hanging indefinitely; bash subshells and command substitutions resolve correctly; pwsh integration tolerates a missing PSReadLine module without crashing the worker. 240 / 240 tests pass.
+
+### Added
+- **cmd.exe AI command support** — multi-line cmd commands (heredoc-equivalent batch blocks, `if/else`, `for /l`, `setlocal enabledelayedexpansion` with `!VAR!`) now work via a tempfile `.cmd` wrapper called from a single-line PTY input. ConPTY's input echo is stripped from the captured slice via `StripCmdInputEcho` so AI output mirrors what pwsh and bash produce.
+- **cmd.exe user-busy detection** — a side-channel polling loop (cmd worker only, Windows only) samples the cmd process's CPU time delta and child-process count every 500 ms. CPU > 50 ms / 500 ms catches builtins like `dir /s`; child detection via `CreateToolhelp32Snapshot` catches external commands like `notepad`, `git`, `xcopy`, `timeout /t`. Either signal flips the tracker to busy so `execute_command` auto-routes around the user. Suppressed during AI command execution.
+- **Multi-shell E2E test suite** — `RunMultiShell` exercises pwsh / Windows PowerShell 5.1 / cmd / bash through the worker pipe protocol with shell-specific `ShellProfile`s. Covers ready/standby state, simple echo with input-echo strip assertion, session variable persistence, multi-line block syntax, and (bash) subshell capture + exit-code propagation. `RunIntegrationScriptGuardTest` verifies `integration.ps1` doesn't crash when PSReadLine is unloaded.
+- **Additional E2E tests for pwsh** — session variable persistence across execute calls, multi-line foreach, slow-command timeout + busy-state probe, cached output retrieval after timeout, `send_input` rejection on idle consoles, `send_input` Ctrl+C interrupt with standby recovery.
+
+### Changed
+- **bash integration rewritten from DEBUG trap to PS0** — `PS0=$'\\e]633;C\\a'` fires OSC 633 C exactly once per command-line submit in the parent shell, working for subshells (`(echo foo)`), command substitutions (`$(date)`), pipelines, brace groups, and multi-statement lines. The old DEBUG trap approach couldn't fire for compound commands without `set -T`, and even with functrace had recursive emission issues inside `__sp_precmd`. The `__sp_in_command` flag and DEBUG trap are deleted entirely; `__sp_precmd` now emits OSC D unconditionally.
+- **bash multi-line / multi-statement command capture** — multi-line bodies route through a tempfile `.sh` dot-source with WSL/MSYS path translation. Multi-statement single-line commands (`cmd1; cmd2; cmd3`) capture all output in order — previously only the last statement was reported because each sub-command's DEBUG firing reset the OSC C marker.
+- **cmd.exe status line** — now renders as `○ Finished (exit code unavailable)` instead of a misleading `✓ Completed`. cmd's PROMPT can't expand `%ERRORLEVEL%` at display time, so the worker reports a fake exit 0 for every command; the new status text makes that limitation visible to the AI instead of silently lying.
+- **Long status-line commands truncated** — the pipeline column in status lines now caps at 60 characters with `...` to keep multi-line responses readable.
+
+### Fixed
+- **cmd.exe AI commands hung forever** — cmd has no preexec hook to fire OSC 633 C, so the proxy tracker waited on a `_commandStart` that never advanced. The worker now calls `SkipCommandStartMarker()` after `RegisterCommand` for cmd, and cmd's PROMPT emits a fake `OSC 633 D;0` so the resolve path completes.
+- **bash subshell commands hung forever** — `(echo foo)`, `(exit N)`, command substitutions all blocked the AI tracker indefinitely (and the multi-statement gate before that fix only captured the last sub-command's output). The PS0 rewrite resolves both issues.
+- **bash multi-line newlines lost in PTY echo** — embedded `\n` in execute payloads got submitted as Enter and dropped subsequent lines into the continuation prompt. The tempfile-dot-source path preserves the body as a single source file.
+- **pwsh integration crash when PSReadLine missing** — `Set-PSReadLineKeyHandler` and `Set-PSReadLineOption` calls are now guarded by `Get-Module PSReadLine` plus per-call `try/catch` so a screen-reader fallback or `Remove-Module` doesn't throw `CommandNotFoundException` at integration-load time.
+
+### Known limitations
+- **cmd.exe exit codes are always reported as 0**. cmd's PROMPT can't expand `%ERRORLEVEL%` at display time, so the worker emits a fake `OSC 633 D;0` after every command. AI commands show as `Finished (exit code unavailable)` to make the limitation visible. Use pwsh or bash if you need exit-code-aware execution. (The visible terminal still has the real `%ERRORLEVEL%`; only the AI-side capture is affected.)
+- **`Remove-Module PSReadLine` mid-session breaks the pwsh worker.** PSReadLine spawns persistent reader threads that survive module unload (.NET can't fully unload binary modules), so the orphaned threads keep consuming console input bytes and the next AI command hangs forever. Splash can't recover from this state. Documented in README.
+- **cmd.exe builtin interactive prompts are not detected as user-busy** (`pause`, `set /p`). Zero CPU + zero children leave both polling signals silent. Uncommon enough to leave undetected.
+
 ## [0.4.0] - 2026-04-12
 
 ### Added
