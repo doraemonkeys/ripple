@@ -1,4 +1,5 @@
-﻿using System.IO.Pipes;
+﻿using System.Diagnostics;
+using System.IO.Pipes;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -225,6 +226,18 @@ public class ConsoleWorker
 
         // Monitor visible console window resizes and propagate to ConPTY
         var resizeTask = ResizeMonitorLoop(ct);
+
+        // cmd has no preexec hook (no PROMPT-time access to %ERRORLEVEL%, no
+        // way to fire OSC 633 C when the user starts a command), so the
+        // OSC-driven user-busy tracking that pwsh and bash rely on is silent
+        // for cmd. Run a side-channel polling loop that watches the cmd
+        // process's CPU usage and child-process count to derive a busy hint:
+        // CPU > 0 → cmd is running an internal builtin, child present → cmd
+        // launched an external command. Either signal flips the tracker to
+        // busy so execute_command auto-routes around the user.
+        Task? userBusyTask = null;
+        if (OperatingSystem.IsWindows() && shellName == "cmd")
+            userBusyTask = UserBusyDetectorLoop(ct);
 
         // Run owned + unowned pipe servers. Two owned listeners share the
         // pipe name via NamedPipeServerStream.MaxAllowedServerInstances — a
@@ -464,6 +477,125 @@ public class ConsoleWorker
             injection.AppendLine("SPLASHSHELL_EOF");
             injection.AppendLine($"source {tmpFile}; rm -f {tmpFile}");
             await WriteToPty(injection.ToString(), ct);
+        }
+    }
+
+    // --- cmd user-busy detector (CPU + child polling) ---
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct PROCESSENTRY32
+    {
+        public uint dwSize;
+        public uint cntUsage;
+        public uint th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID;
+        public uint cntThreads;
+        public uint th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExeFile;
+    }
+
+    private const uint TH32CS_SNAPPROCESS = 0x00000002;
+    private const uint INVALID_HANDLE_VALUE_UINT = 0xFFFFFFFF;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool Process32FirstW(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool Process32NextW(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    /// <summary>
+    /// Walk the live process snapshot and return true if any process has
+    /// the given PID as its direct parent. Used by the cmd polling loop to
+    /// detect external commands the user has launched (notepad, git, etc).
+    /// </summary>
+    private static bool HasChildProcess(int parentPid)
+    {
+        var snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == IntPtr.Zero || (ulong)snap.ToInt64() == INVALID_HANDLE_VALUE_UINT)
+            return false;
+        try
+        {
+            var entry = new PROCESSENTRY32 { dwSize = (uint)Marshal.SizeOf<PROCESSENTRY32>() };
+            if (!Process32FirstW(snap, ref entry)) return false;
+            do
+            {
+                if (entry.th32ParentProcessID == (uint)parentPid)
+                    return true;
+            } while (Process32NextW(snap, ref entry));
+            return false;
+        }
+        finally
+        {
+            CloseHandle(snap);
+        }
+    }
+
+    /// <summary>
+    /// Sample the cmd process's CPU time and child-process count every
+    /// 500 ms and forward the OR'd result to the tracker as a user-busy
+    /// hint. The threshold of 50 ms over 500 ms is well above Windows's
+    /// 15.625 ms timer-tick noise floor (idle cmd shows 0–1 ticks per
+    /// window) and well below any real workload (`dir /s C:\Windows`
+    /// measured at 200–340 ms per window).
+    /// </summary>
+    private async Task UserBusyDetectorLoop(CancellationToken ct)
+    {
+        const int PollIntervalMs = 500;
+        var cpuBusyThreshold = TimeSpan.FromMilliseconds(50);
+
+        Process? proc;
+        try { proc = Process.GetProcessById(_pty!.ProcessId); }
+        catch { return; }
+
+        long lastCpuTicks = 0;
+        bool firstSample = true;
+
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try { await Task.Delay(PollIntervalMs, ct); }
+                catch (OperationCanceledException) { break; }
+
+                try
+                {
+                    proc.Refresh();
+                    if (proc.HasExited) break;
+
+                    long currentTicks = proc.TotalProcessorTime.Ticks;
+                    bool cpuBusy = false;
+                    if (!firstSample)
+                    {
+                        var delta = currentTicks - lastCpuTicks;
+                        cpuBusy = delta > cpuBusyThreshold.Ticks;
+                    }
+                    lastCpuTicks = currentTicks;
+                    firstSample = false;
+
+                    bool hasChild = HasChildProcess(_pty.ProcessId);
+                    _tracker.SetUserBusyHint(cpuBusy || hasChild);
+                }
+                catch (Exception ex)
+                {
+                    Log($"UserBusyDetector tick failed: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+        }
+        finally
+        {
+            try { _tracker.SetUserBusyHint(false); } catch { }
+            proc.Dispose();
         }
     }
 

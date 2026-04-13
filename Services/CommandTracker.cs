@@ -53,6 +53,7 @@ public class CommandTracker
     private CancellationTokenRegistration _timeoutReg;
     private bool _isAiCommand;
     private bool _userCommandBusy;
+    private bool _userBusyByPolling; // set by ConsoleWorker's CPU/child polling for cmd
     private bool _shellReady; // flipped on first PromptStart; gates user-busy tracking
     private string _aiOutput = "";
     private bool _truncated;
@@ -100,8 +101,23 @@ public class CommandTracker
         lock (_lock) { _terminalCols = cols; _terminalRows = rows; }
     }
 
-    public bool Busy => _isAiCommand || _userCommandBusy;
+    public bool Busy => _isAiCommand || _userCommandBusy || _userBusyByPolling;
     public bool HasCachedOutput => _cachedResult != null;
+
+    /// <summary>
+    /// Update the polling-based user-busy hint. Used by ConsoleWorker for
+    /// shells (cmd) that have no preexec hook and therefore can't fire OSC
+    /// 633 C/B markers when the user starts a command. Skipped during AI
+    /// command execution because the AI tracker has its own busy state.
+    /// </summary>
+    public void SetUserBusyHint(bool busy)
+    {
+        lock (_lock)
+        {
+            if (_isAiCommand) return;
+            _userBusyByPolling = busy;
+        }
+    }
 
     /// <summary>
     /// Text of the AI command currently executing, or null when idle / the

@@ -397,6 +397,55 @@ public class CommandTrackerTests
                 $"recent: OSC A after first cycle preserves output — got: {afterPrompt}");
         }
 
+        // SetUserBusyHint — polling-based busy reporting for cmd.
+        // The tracker's Busy property must OR the polling hint with the OSC
+        // signals so the cmd worker can flip the state from its CPU/child
+        // sampler without depending on shell integration.
+        {
+            var t = new CommandTracker();
+            PrimeShellReady(t);
+            Assert(!t.Busy, "polling hint: idle by default");
+
+            t.SetUserBusyHint(true);
+            Assert(t.Busy, "polling hint: true makes Busy true");
+
+            t.SetUserBusyHint(false);
+            Assert(!t.Busy, "polling hint: false makes Busy false again");
+        }
+
+        // SetUserBusyHint must be a no-op while an AI command is in flight,
+        // because the AI command has its own _isAiCommand busy state and the
+        // poll loop might race a "not busy" reading right as a fresh AI cmd
+        // is registered.
+        {
+            var t = new CommandTracker();
+            PrimeShellReady(t);
+            _ = t.RegisterCommand("Get-Date", timeoutMs: 30_000);
+            Assert(t.Busy, "polling hint vs AI: Busy from AI command");
+
+            t.SetUserBusyHint(false);
+            Assert(t.Busy, "polling hint: false ignored while AI command active");
+        }
+
+        // OSC user-busy and polling hint coexist — both signals can mark
+        // busy independently and clearing one doesn't clear the other.
+        {
+            var t = new CommandTracker();
+            PrimeShellReady(t);
+
+            t.HandleEvent(new OscParser.OscEvent(OscParser.OscEventType.CommandExecuted));
+            Assert(t.Busy, "polling+osc: OSC C set busy");
+
+            t.SetUserBusyHint(true);
+            Assert(t.Busy, "polling+osc: both signals busy");
+
+            t.HandleEvent(new OscParser.OscEvent(OscParser.OscEventType.PromptStart));
+            Assert(t.Busy, "polling+osc: OSC A clears OSC busy but polling still busy");
+
+            t.SetUserBusyHint(false);
+            Assert(!t.Busy, "polling+osc: clearing both finally clears Busy");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
