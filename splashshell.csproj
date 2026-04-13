@@ -14,7 +14,7 @@
     <StripSymbols>true</StripSymbols>
     <Authors>Yoshifumi Tsuda</Authors>
     <Company>Yoshifumi Tsuda</Company>
-    <Product>splashshell</Product>
+    <Product>SplashShell</Product>
     <Description>Universal MCP server that exposes any shell (bash, pwsh, cmd) over ConPTY</Description>
     <Copyright>Copyright (c) 2026 Yoshifumi Tsuda</Copyright>
   </PropertyGroup>

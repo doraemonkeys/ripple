@@ -1,4 +1,4 @@
-# splashshell
+# SplashShell
 
 <div align="center">
   <img src="https://github.com/user-attachments/assets/1343f694-1c05-4899-9faa-d2b1138aa3ba" alt="social-image" width="640" />
@@ -6,15 +6,15 @@
 
 A universal MCP server that gives AI assistants a **real, visible terminal** — the same one you're looking at. Run any shell (bash, pwsh, cmd), see every command the AI executes, type into the same console yourself, and keep session state alive across calls.
 
-## Why splashshell?
+## Why SplashShell?
 
-Most shell MCP servers fall into one of two buckets: **stateless** (each command runs in an isolated subprocess — nothing persists) or **headless** (the AI has a persistent PTY, but you can't see it or type into it). splashshell is neither.
+Most shell MCP servers fall into one of two buckets: **stateless** (each command runs in an isolated subprocess — nothing persists) or **headless** (the AI has a persistent PTY, but you can't see it or type into it). SplashShell is neither.
 
 ### You and AI share the same terminal
 
-splashshell opens a **real, visible terminal window**. When the AI runs a command, you see it happen in real time — the same characters, the same output, the same prompt. You can type into the same terminal at any time. The AI can see what you typed via `peek_console`. This isn't a web dashboard or a log viewer — it's the actual terminal.
+SplashShell opens a **real, visible terminal window**. When the AI runs a command, you see it happen in real time — the same characters, the same output, the same prompt. You can type into the same terminal at any time. The AI can see what you typed via `peek_console`. This isn't a web dashboard or a log viewer — it's the actual terminal.
 
-Most shell MCP servers use a headless PTY that the user can't see. splashshell takes the opposite approach: full transparency, full control, no external dependencies.
+Most shell MCP servers use a headless PTY that the user can't see. SplashShell takes the opposite approach: full transparency, full control, no external dependencies.
 
 ### The AI can see the screen and respond to it
 
@@ -30,7 +30,7 @@ This means the AI can diagnose and respond to interactive prompts (`Read-Host`, 
 
 All shells benefit from persistent sessions (environment variables, command history, working directory). But for **PowerShell, session persistence is critical**:
 
-- **Module import cost**: A cold `Import-Module Az.Compute, Az.Storage` takes **30–70 seconds**. With splashshell, the AI imports once and every subsequent cmdlet call returns in under a second
+- **Module import cost**: A cold `Import-Module Az.Compute, Az.Storage` takes **30–70 seconds**. With SplashShell, the AI imports once and every subsequent cmdlet call returns in under a second
 - **Object pipeline**: PowerShell passes .NET objects, not text. `$issues = gh issue list ... | ConvertFrom-Json` stores a rich object — filter it, transform it, join it across commands. In an isolated subprocess, that object vanishes after each call
 - **10,000+ modules on [PowerShell Gallery](https://www.powershellgallery.com/)**: Az, AWS.Tools, Microsoft.Graph, ExchangeOnlineManagement, PnP.PowerShell — plus any CLI tool (git, docker, kubectl, terraform, gh)
 
@@ -48,7 +48,7 @@ Get-AzStorageAccount | Select-Object StorageAccountName, Location, Kind
 
 ### Structured command lifecycle
 
-splashshell injects [OSC 633 shell integration](https://code.visualstudio.com/docs/terminal/shell-integration) scripts (the same protocol VS Code uses) into every shell it starts. This gives it reliable, marker-based detection of:
+SplashShell injects [OSC 633 shell integration](https://code.visualstudio.com/docs/terminal/shell-integration) scripts (the same protocol VS Code uses) into every shell it starts. This gives it reliable, marker-based detection of:
 - When a command starts and finishes (not heuristic — explicit markers)
 - The exit code
 - The current working directory after each command
@@ -71,7 +71,7 @@ Other MCP servers rely on output-silence heuristics (`waitForIdle`) or prompt-st
 graph TB
     Client["MCP Client<br/>(Claude Code, etc.)"]
 
-    subgraph Proxy["splashshell proxy (stdio MCP server)"]
+    subgraph Proxy["SplashShell proxy (stdio MCP server)"]
         CM["Console Manager<br/>(cwd tracking, re-claim,<br/>cache drain, switching)"]
         Tools["start_console<br/>execute_command<br/>wait_for_completion<br/>peek_console / send_input<br/>read_file / write_file / edit_file<br/>search_files / find_files"]
     end
@@ -101,7 +101,7 @@ graph TB
 
 ## Install
 
-No global install is required — `npx` fetches and runs splashshell on demand. The only prerequisite is the [.NET 9 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/9.0) (the package bundles a ~5.6 MB native `splash.exe` that needs it).
+No global install is required — `npx` fetches and runs SplashShell on demand. The only prerequisite is the [.NET 9 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/9.0) (the package bundles a ~5.6 MB native `splash.exe` that needs it).
 
 > The `@latest` tag is important: without it, npx will happily keep reusing a stale cached copy even after a new version ships.
 
@@ -178,7 +178,7 @@ Claude Code–compatible file primitives, useful when the MCP client doesn't alr
 
 ## Multi-shell behavior
 
-splashshell tracks the cwd of every console and can switch transparently between same-shell consoles:
+SplashShell tracks the cwd of every console and can switch transparently between same-shell consoles:
 
 | Scenario | Behavior |
 |---|---|
@@ -200,19 +200,19 @@ Window titles use the format `#PID Name` (e.g., `#12345 Sapphire`) so you can id
 
 ### cmd.exe exit codes are always reported as 0
 
-cmd.exe's `PROMPT` variable can't expand `%ERRORLEVEL%` at display time (it's a static template, not a script), so splash's shell integration falls back to emitting a fake `OSC 633;D;0` marker on every prompt. AI-initiated cmd commands therefore show as `Finished (exit code unavailable)` in the status line — the literal exit code is unobtainable. Use `pwsh` or `bash` if you need exit-code-aware execution. (The visible terminal still has the real `%ERRORLEVEL%`; only the AI-side capture is affected.)
+cmd.exe's `PROMPT` variable can't expand `%ERRORLEVEL%` at display time (it's a static template, not a script), so SplashShell's shell integration falls back to emitting a fake `OSC 633;D;0` marker on every prompt. AI-initiated cmd commands therefore show as `Finished (exit code unavailable)` in the status line — the literal exit code is unobtainable. Use `pwsh` or `bash` if you need exit-code-aware execution. (The visible terminal still has the real `%ERRORLEVEL%`; only the AI-side capture is affected.)
 
-### Don't `Remove-Module PSReadLine` inside a splash pwsh session
+### Don't `Remove-Module PSReadLine` inside a SplashShell pwsh session
 
-Splash's pwsh integration relies on PSReadLine's input loop. Running `Remove-Module PSReadLine -Force` mid-session strands PSReadLine's background reader threads — they keep consuming console input bytes after the module unregisters its cmdlets, so pwsh's fallback `ReadConsoleW` never sees the AI's next command and the session hangs indefinitely.
+SplashShell's pwsh integration relies on PSReadLine's input loop. Running `Remove-Module PSReadLine -Force` mid-session strands PSReadLine's background reader threads — they keep consuming console input bytes after the module unregisters its cmdlets, so pwsh's fallback `ReadConsoleW` never sees the AI's next command and the session hangs indefinitely.
 
-This is a structural problem (PSReadLine spawns persistent reader threads, .NET can't fully unload binary modules, and there's no way to kill the orphaned threads from outside the process). Splash can't recover from it.
+This is a structural problem (PSReadLine spawns persistent reader threads, .NET can't fully unload binary modules, and there's no way to kill the orphaned threads from outside the process). SplashShell can't recover from it.
 
-If your workflow needs a pwsh session without PSReadLine, start a fresh console and avoid loading PSReadLine — splash's integration script tolerates a missing module at startup.
+If your workflow needs a pwsh session without PSReadLine, start a fresh console and avoid loading PSReadLine — SplashShell's integration script tolerates a missing module at startup.
 
 ## How it works
 
-splashshell runs as a stdio MCP server. When the AI calls `start_console`, splashshell spawns itself in `--console` mode as a ConPTY worker, which hosts the actual shell (cmd.exe, pwsh.exe, bash.exe, etc.) inside a real Windows console window. The parent process streams stdin/stdout over a named pipe, injects shell integration scripts (`ShellIntegration/integration.*`) to emit OSC 633 markers, and parses those markers to delimit command output, track cwd, and capture exit codes.
+SplashShell runs as a stdio MCP server. When the AI calls `start_console`, SplashShell spawns itself in `--console` mode as a ConPTY worker, which hosts the actual shell (cmd.exe, pwsh.exe, bash.exe, etc.) inside a real Windows console window. The parent process streams stdin/stdout over a named pipe, injects shell integration scripts (`ShellIntegration/integration.*`) to emit OSC 633 markers, and parses those markers to delimit command output, track cwd, and capture exit codes.
 
 Result: the AI gets structured command-by-command output, the user gets a real terminal they can type into, and session state (cwd, env, history) persists across every call.
 
