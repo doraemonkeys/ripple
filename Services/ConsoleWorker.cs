@@ -624,6 +624,26 @@ public class ConsoleWorker
                 ("shell_path", _shell));
         }
 
+        // Generic REPL adapter: command_template without an integration
+        // script. Used by adapters whose REPL has no script-load
+        // mechanism (or doesn't need one), e.g. groovy (regex strategy,
+        // direct java invocation with a jar classpath) and jshell
+        // (regex strategy, bare `jshell` invocation). Unlike the
+        // "REPL-style with script" branch above (which requires
+        // Init.Delivery == launch_command + script_resource), this
+        // path fires whenever an adapter declares a command_template
+        // but no integration script. `{init_invocation}` is NOT
+        // substituted here — adapters on this path must not reference
+        // it. ExpandTemplate additionally applies %ENVVAR% expansion
+        // so paths like `%LOCALAPPDATA%\splash-deps\...` resolve.
+        if (!_isPwshFamily && shellName != "cmd" &&
+            _adapter is { } cmdTplAdapter &&
+            !string.IsNullOrEmpty(cmdTplAdapter.Process.CommandTemplate))
+        {
+            return ExpandTemplate(cmdTplAdapter.Process.CommandTemplate,
+                ("shell_path", _shell));
+        }
+
         // Fallback: no YAML adapter for this shell family — keep the
         // hardcoded launch strings so unknown shells still boot.
         if (shellName is "bash" or "sh")
@@ -647,6 +667,14 @@ public class ConsoleWorker
         var result = template;
         foreach (var (name, value) in vars)
             result = result.Replace("{" + name + "}", value);
+        // After the named-placeholder substitution, also expand Windows
+        // `%ENVVAR%` references so adapter authors can reference user-
+        // specific paths like `%LOCALAPPDATA%\splash-deps\...` without
+        // splash having to mint a new named placeholder for every
+        // possible env var. No-op on non-Windows (the method just
+        // returns the input unchanged there).
+        if (OperatingSystem.IsWindows())
+            result = Environment.ExpandEnvironmentVariables(result);
         return result;
     }
 
