@@ -214,7 +214,17 @@ public static class BalancedParensCounter
             if (matchedClose) continue;
 
             // --- ordinary atom character: resolves a pending datum comment ---
-            if (pendingDatumComments > 0 && !char.IsWhiteSpace(input[i]))
+            // IMPORTANT: only fires when there is NO active datum-commented
+            // list (anchor stack empty). Atoms inside a datum-commented
+            // list are already being skipped by the list's bracket
+            // accounting — decrementing pending for them would prematurely
+            // resolve a still-pending outer `#;`. Example: `#;#;(a)` needs
+            // two datums; without this guard the inner `a` would decrement
+            // pending from 1 to 0 and the counter would wrongly report the
+            // whole input as complete.
+            if (pendingDatumComments > 0
+                && datumCommentAnchorDepths.Count == 0
+                && !char.IsWhiteSpace(input[i]))
             {
                 // Consume the atom run (non-whitespace, non-bracket,
                 // non-string-delim) and decrement the pending counter.
