@@ -1,0 +1,146 @@
+schema: 1
+name: racket
+version: 0.1.0
+description: >
+  Racket REPL with OSC 633 shell-integration-style command tracking. The
+  integration script overrides current-prompt-read to emit OSC D / P / A
+  around the default `> ` prompt, so splash sees the same command
+  boundaries it does for pwsh / bash / python / node. The first live Lisp-
+  family adapter — exercises schema §18 Q1 (balanced_parens expressiveness
+  vs reader macros) with evidence instead of theory.
+homepage: https://github.com/yotsuda/splash
+license: MIT
+family: repl
+aliases:
+  - rkt
+
+process:
+  # `racket -f integration.rkt` loads the integration script as top-level
+  # forms in the initial namespace, which is also where the REPL ends up
+  # reading/eval'ing subsequent input. We don't use `-i` because Racket's
+  # built-in -i REPL starts in a fresh dynamic extent that does not
+  # inherit `current-prompt-read` set during -f loading — the integration
+  # script therefore calls `(read-eval-print-loop)` itself after wiring
+  # up the parameter.
+  command_template: '"{shell_path}" -f {init_invocation}'
+  inherit_environment: true
+  encoding: utf-8
+  # Racket's interactive reader, like CPython's, treats \r as "Enter
+  # pressed" on Windows under ConPTY cooked mode. \n alone doesn't submit
+  # the line.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  # Racket cold start is ~200-500ms; no settle needed.
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  delay_after_inject_ms: 0
+
+init:
+  strategy: shell_integration
+  hook_type: prompt_variable        # current-prompt-read override
+  delivery: launch_command
+  tempfile:
+    prefix: .splash-integration-
+    extension: .rkt
+  init_invocation_template: '"{tempfile_path}"'
+  script_resource: integration.rkt
+
+prompt:
+  strategy: shell_integration
+  shell_integration:
+    protocol: osc633
+    markers:
+      prompt_start: "A"
+      command_finished: "D"
+      property_update: "P"
+    property_updates:
+      cwd_key: Cwd
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  # Racket echoes input through the PTY and has no OSC B marker, so strip
+  # echo deterministically the same way cmd and python do.
+  strip_input_echo: true
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  # Schema §18 Q1 observation: balanced_parens is declared here so the
+  # adapter exercises the schema field, but the runtime does not yet
+  # consume MultilineDetect — it's a gating pre-check that Phase D will
+  # add. Until then, multi-line REPL blocks go through tempfile delivery
+  # (the same path python uses for def/class bodies), so command
+  # boundaries stay clean regardless of reader-macro complications.
+  multiline_detect: balanced_parens
+  balanced_parens:
+    open: ['(', '[', '{']
+    close: [')', ']', '}']
+    string_delims: ['"']
+    escape: '\'
+    line_comment: ';'
+    block_comment: ['#|', '|#']
+  multiline_delivery: tempfile
+  tempfile:
+    prefix: .splash-exec-
+    extension: .rkt
+    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.rkt"
+    invocation_template: '(_splash_exec_file "{path}")'
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: "(exit)"
+    grace_ms: 1000
+    force_signal: kill
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: false
+  async_output: false
+  # Racket REPL has no per-expression exit code; errors print a message
+  # but the prompt still returns, so OSC D always carries 0.
+  exit_code: "unreliable"
+  cwd_tracking: true
+  cwd_format: windows_native
+  job_control: false
+  shell_integration: osc633
+  user_busy_detection: none
+
+probe:
+  eval: "(+ 1 1)"
+  expect: '^2$'
+
+tests:
+  - name: "integer arithmetic returns a value"
+    eval: "(* 21 2)"
+    expect: '42'
+
+  - name: "stateful: define persists across commands"
+    setup_sequence:
+      - eval: "(define splash-test 'persist-ok)"
+    eval: "splash-test"
+    expect: 'persist-ok'
+
+  - name: "reader macro: datum comment does not break arithmetic"
+    eval: "(+ 1 #;(999) 2)"
+    expect: '^3$'
+
+  - name: "reader macro: block comment #| |# ignored"
+    eval: "(+ 1 #| nested |# 2)"
+    expect: '^3$'
+
+  - name: "char literal: #\\( is a character not an open paren"
+    eval: "(char->integer #\\()"
+    expect: '40'
