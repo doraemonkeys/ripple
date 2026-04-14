@@ -1,0 +1,130 @@
+schema: 1
+name: jshell
+version: 0.1.0
+description: >
+  Java jshell REPL (JShell, since JDK 9). Tenth embedded adapter and
+  the second client of `prompt.strategy: regex` after fsi — exercises
+  the CSI-aware RegexPromptDetector against a different ConPTY-rendering
+  REPL with a fundamentally similar shape (banner, single-line prompt
+  string, no documented prompt-replacement API). Unlike fsi, jshell
+  does NOT need a script-load workaround: `jshell` started under
+  ConPTY launches cleanly and reaches its first prompt within ~1s.
+homepage: https://docs.oracle.com/en/java/javase/21/jshell/
+license: GPL-2.0
+family: repl
+aliases:
+  - java-shell
+
+process:
+  # jshell.exe is shipped with the JDK at
+  # %ProgramFiles%\Microsoft\jdk-21\bin\jshell.exe (or the upstream
+  # OpenJDK / Temurin equivalent). Resolve via PATH so the adapter
+  # works against whichever JDK happens to be on the test box.
+  command_template: '"{shell_path}"'
+  inherit_environment: true
+  encoding: utf-8
+  # jshell on Windows reads stdin via the JLine console (which itself
+  # wraps Win32 ReadConsole), and treats \r as Enter under ConPTY
+  # cooked mode. Same convention as Python / Node / Racket / fsi.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  # jshell cold start is ~800ms after the JVM warms up. The CSI-aware
+  # regex detector fires once `jshell> ` appears on its own line, no
+  # special settling needed (unlike fsi which has a two-prompt
+  # script-load race).
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  delay_after_inject_ms: 0
+
+init:
+  strategy: regex
+  hook_type: none
+  delivery: none
+
+prompt:
+  strategy: regex
+  # jshell prints `jshell> ` (with trailing space) when ready for
+  # input, and `   ...> ` for continuation (incomplete statement
+  # spanning multiple lines). Match only the top-level prompt for
+  # boundary detection — continuation prompts shouldn't reset the
+  # tracker. Anchored on line start because the CSI-aware detector
+  # converts cursor positioning to col 1 into a literal newline.
+  primary: '^jshell> $'
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  strip_input_echo: true
+  # jshell has no OSC C / B (no integration hook), so strip input
+  # echo deterministically the same way python / node / fsi do.
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  # jshell's tolerant parser handles multi-line input directly: if
+  # splash writes a multi-line block (e.g. a method definition) all
+  # at once, jshell reads each line, sees the continuation state,
+  # and waits for the closing brace before evaluating. Schema-wise
+  # this is `prompt_based` (continuation prompt would be the
+  # detection signal), but splash's current runtime does not consume
+  # multiline_detect at all — multi-line bodies just stream through
+  # as `direct` delivery and jshell takes care of buffering. The
+  # field is declared aspirationally so a future runtime that
+  # implements pre-send gating sees the right intent.
+  multiline_detect: prompt_based
+  multiline_delivery: direct
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: "/exit"
+    grace_ms: 1000
+    force_signal: kill
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: true   # jshell has /help, /list, /vars, /methods, /exit, ...
+  async_output: false
+  # jshell REPL has no per-expression exit code; errors print a
+  # diagnostic line prefixed with "|  Error:" and the prompt still
+  # returns. Same convention as python / racket / fsi.
+  exit_code: "unreliable"
+  cwd_tracking: false
+  cwd_format: "none"
+  job_control: false
+  shell_integration: null
+  user_busy_detection: none
+
+probe:
+  eval: "1 + 1"
+  expect: '\$1 ==> 2'
+
+tests:
+  - name: "expression with auto-named result"
+    eval: "21 * 2"
+    expect: '==> 42'
+
+  - name: "stateful: variable persists across commands"
+    setup_sequence:
+      - eval: "int splashTest = 42;"
+    eval: "splashTest"
+    expect: 'splashTest ==> 42'
+
+  - name: "string concatenation with type inference"
+    eval: '"hello, " + "splash"'
+    expect: '"hello, splash"'
+
+  - name: "list/array expression returns typed result"
+    eval: 'java.util.stream.IntStream.rangeClosed(1, 5).sum()'
+    expect: '==> 15'
