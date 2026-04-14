@@ -49,6 +49,18 @@ public class ProcessSpec
     public Dictionary<string, string>? Env { get; set; }
     public string Encoding { get; set; } = "utf-8";
     public string LineEnding { get; set; } = "\n";
+
+    /// <summary>
+    /// Optional override: the actual binary to launch when this adapter
+    /// is selected, distinct from the adapter's <c>name</c>. Used by
+    /// adapters where the user-facing REPL name does not match an
+    /// executable on PATH — e.g. <c>fsi</c> (the F# Interactive REPL)
+    /// is launched via <c>dotnet fsi</c>, not a standalone fsi.exe. The
+    /// worker re-resolves <c>{shell_path}</c> against this override
+    /// before expanding <see cref="CommandTemplate"/>. When null, the
+    /// default behaviour applies: the shell name is resolved verbatim.
+    /// </summary>
+    public string? Executable { get; set; }
 }
 
 public class ReadySpec

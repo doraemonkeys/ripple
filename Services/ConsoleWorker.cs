@@ -105,6 +105,20 @@ public class ConsoleWorker
     private int? _currentModeLevel;
     private Stream? _writer;
     private readonly OscParser _parser = new();
+
+    /// <summary>
+    /// Regex-based prompt detector for adapters that declare
+    /// <c>prompt.strategy: regex</c> (REPLs whose prompt cannot be replaced
+    /// to emit OSC 633 markers — F# Interactive, ghci without integration,
+    /// etc.). Null for adapters using <c>shell_integration</c> or
+    /// <c>marker</c> strategies, in which case <see cref="OscParser"/> alone
+    /// drives prompt boundary detection. Fed by the same read loop that
+    /// feeds <see cref="_parser"/>; the synthetic events it produces are
+    /// merged with real OSC events in TextOffset order so
+    /// <see cref="CommandTracker"/> sees one coherent stream.
+    /// </summary>
+    private readonly RegexPromptDetector? _regexPromptDetector;
+    private bool _regexFirstPromptSeen;
     private readonly CommandTracker _tracker = new();
     private bool _ready;
     private volatile int _outputLength;
@@ -158,6 +172,37 @@ public class ConsoleWorker
         Log(_adapter != null
             ? $"Adapter matched: name={_adapter.Name} family={_adapter.Family} version={_adapter.Version}"
             : $"No adapter matched for shell family '{_shellFamily}' — using hardcoded fallback");
+
+        // process.executable override: for adapters whose REPL name does
+        // not match an executable on PATH (fsi → dotnet, jshell → java,
+        // etc.), the adapter declares which binary to launch. Re-resolve
+        // _shell against that name so {shell_path} expansion in
+        // BuildCommandLine produces the right launcher.
+        if (!string.IsNullOrEmpty(_adapter?.Process.Executable))
+        {
+            var resolved = ConsoleManager.ResolveShellPath(_adapter.Process.Executable);
+            Log($"Executable override: {_adapter.Process.Executable} → {resolved}");
+            _shell = resolved;
+        }
+
+        // Adapters with prompt.strategy == "regex" don't speak OSC 633 at
+        // all; the prompt is a literal visible string like "> " (F# Interactive)
+        // or "irb(main):001:0> " (irb). Construct a RegexPromptDetector now
+        // so the read loop can scan the cleaned PTY output for prompt
+        // boundaries and synthesize PromptStart events for the tracker.
+        if (_adapter?.Prompt.Strategy == "regex")
+        {
+            var pattern = _adapter.Prompt.Primary ?? _adapter.Prompt.PrimaryRegex;
+            if (!string.IsNullOrEmpty(pattern))
+            {
+                _regexPromptDetector = new RegexPromptDetector(pattern);
+                Log($"Regex prompt detector active: pattern={pattern}");
+            }
+            else
+            {
+                Log("WARNING: prompt.strategy == regex but no prompt.primary / prompt.primary_regex set");
+            }
+        }
 
         // Milestone 2i: bake shell-family booleans into readonly fields so
         // no in-worker code needs ConsoleManager.IsPowerShellFamily /
@@ -287,6 +332,23 @@ public class ConsoleWorker
         await WaitForReady(ct);
         _ready = true;
         _mirrorVisible = true;
+
+        // For regex-strategy adapters, the FIRST visible prompt may
+        // appear before the REPL's eval loop has finished wiring up
+        // (fsi --use:script.fsx is the canonical case: the post-script
+        // -load prompt fires ~200ms before stdin input is actually
+        // accepted by the eval loop). The detector has no way to
+        // distinguish "true REPL ready" from "post-script-load
+        // intermediate prompt", so honor an adapter-declared settle
+        // window before letting the worker accept commands. Reuses
+        // ready.delay_after_inject_ms because the semantics are the
+        // same: "wait this long after the ready signal before
+        // declaring the worker open for business".
+        if (_regexPromptDetector != null && _adapter?.Ready.DelayAfterInjectMs is int dms && dms > 0)
+        {
+            Log($"regex strategy: settling {dms} ms after first prompt before pipe ready");
+            await Task.Delay(dms, ct);
+        }
 
         // For shells with PTY-injected integration (bash/zsh), the prompt drawn
         // during injection was suppressed. Send a kick to draw a fresh prompt.
@@ -1346,6 +1408,44 @@ public class ConsoleWorker
                     var text = Encoding.UTF8.GetString(buffer, 0, read);
                     if (_tracker.Busy) Log($"RAW: {EscapeForLog(text)}");
                     var result = _parser.Parse(text);
+
+                    // For regex-strategy adapters: scan the cleaned chunk
+                    // for prompt boundaries and inject synthetic OSC events
+                    // (CommandFinished + PromptStart, mirroring what the
+                    // python adapter emits for real on each prompt). The
+                    // synthetic events are merged with any real OSC events
+                    // in TextOffset order so the tracker downstream sees
+                    // one coherent stream regardless of which strategy
+                    // fired.
+                    if (_regexPromptDetector != null)
+                    {
+                        // RegexPromptDetector is CSI-aware: it strips
+                        // CSI escapes from result.Cleaned internally
+                        // before running the adapter's prompt regex,
+                        // so the offsets come back in original-byte
+                        // coordinates that line up with the same
+                        // cleaned text we feed to the tracker below.
+                        var promptOffsets = _regexPromptDetector.Scan(result.Cleaned);
+                        if (promptOffsets.Count > 0)
+                        {
+                            var merged = new List<OscParser.OscEvent>(result.Events);
+                            foreach (var offset in promptOffsets)
+                            {
+                                if (_regexFirstPromptSeen)
+                                {
+                                    merged.Add(new OscParser.OscEvent(
+                                        OscParser.OscEventType.CommandFinished,
+                                        ExitCode: 0, TextOffset: offset));
+                                }
+                                merged.Add(new OscParser.OscEvent(
+                                    OscParser.OscEventType.PromptStart,
+                                    TextOffset: offset));
+                                _regexFirstPromptSeen = true;
+                            }
+                            merged.Sort((a, b) => a.TextOffset.CompareTo(b.TextOffset));
+                            result = result with { Events = merged };
+                        }
+                    }
 
                     // Interleave FeedOutput and HandleEvent in source order
                     // using each event's TextOffset (position in Cleaned where
