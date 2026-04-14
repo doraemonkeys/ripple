@@ -2,8 +2,8 @@
 
 Entry point for any future Claude Code (or human) session walking into
 this repo cold. Read this first, then follow the reading list below
-for whatever depth you need. Updated after the phase C completion on
-2026-04-14.
+for whatever depth you need. Updated after the phase C+ punch-list
+cleared on 2026-04-14.
 
 ---
 
@@ -12,15 +12,22 @@ for whatever depth you need. Updated after the phase C completion on
 **splash** is a declarative adapter framework that exposes any
 interactive process (shells, REPLs, eventually debuggers) to an AI
 via MCP over ConPTY/forkpty. Phase B (YAML-drive the existing shell
-runtime) and phase C (framework generalisation: external adapter
+runtime), phase C (framework generalisation: external adapter
 loading, two REPLs, unified env block, tests runner, schema
-evolution) are both complete. 6 adapters ship embedded (pwsh, bash,
-zsh, cmd, python, node). 341 assertions pass on `--test --e2e`
-(252 unit + 63 pre-existing E2E + 26 adapter-declared). Zero
-shell-family literals survive in the C# runtime outside the
-registry key normaliser. Schema is intentionally left as
-`v1 draft` until a Lisp-family or debugger adapter surfaces evidence
-for the open questions in [SCHEMA.md §18](adapters/SCHEMA.md).
+evolution), and the phase C+ punch list (Racket adapter, pdb mode
+declaration, `--probe-adapters` CLI, `ready.output_settled_*`
+timing knobs, BOM fix on `FileTools.WriteFile`, `--list-adapters`
+summary truncation) are all complete. **7 adapters ship embedded**
+(pwsh, bash, zsh, cmd, python, node, racket). **385 assertions**
+pass on `--test --e2e` (274 unit + 79 pre-existing E2E + 32
+adapter-declared). Zero shell-family literals survive in the C#
+runtime outside the registry key normaliser. Schema §18 Q1
+(balanced_parens vs reader macros) is **partially** answered by
+the Racket adapter; §18 Q2 (exit_commands.effect enum) is
+**closed** by the python adapter's pdb mode. Q3 and Q4 are
+untouched. Schema is still intentionally `v1 draft` until a
+runtime counter exists for `multiline_detect: balanced_parens`
+and `modes` graph walking is no longer declarative-only.
 
 ---
 
@@ -28,9 +35,10 @@ for the open questions in [SCHEMA.md §18](adapters/SCHEMA.md).
 
 ```powershell
 cd C:\MyProj\splash
-git log --oneline -20                              # last 20 commits — the phase B/C arc
-./bin/Debug/net9.0/splash.exe --list-adapters      # 6 adapters + their capabilities
-./bin/Debug/net9.0/splash.exe --test --e2e         # 341 / 341 green, zsh SKIP expected
+git log --oneline -25                              # last 25 commits — phase B/C/C+ arc
+./bin/Debug/net9.0/splash.exe --list-adapters      # 7 adapters + their capabilities
+./bin/Debug/net9.0/splash.exe --probe-adapters     # opt-in pre-flight, one probe.eval per adapter
+./bin/Debug/net9.0/splash.exe --test --e2e         # 385 / 385 green, zsh SKIP expected
 ```
 
 If the Debug binary is missing or stale:
@@ -97,10 +105,12 @@ given machine.
    the final `CreateProcessW` command line. The worker also reads
    `adapter.process.env` (merged into the Win32 environment block
    by `ConPty.cs` regardless of inherit vs clean), `adapter.ready.*`
-   for the startup synchronisation flow, `adapter.init.*` for the
-   integration script delivery, `adapter.input.line_ending` for how
-   Enter is written to the PTY, `adapter.output.input_echo_strategy`
-   for how input echo is stripped from captured output, and
+   for the startup synchronisation flow (including the tunable
+   `output_settled_{min,stable,max}_ms` knobs on `WaitForOutputSettled`),
+   `adapter.init.*` for the integration script delivery,
+   `adapter.input.line_ending` for how Enter is written to the PTY,
+   `adapter.output.input_echo_strategy` for how input echo is
+   stripped from captured output, and
    `adapter.capabilities.{user_busy_detection,cwd_format,...}` for
    the feature flags that change runtime behaviour.
 
@@ -110,11 +120,11 @@ given machine.
    P;Cwd=... = cwd update) from their integration script. The worker
    parses these via `OscParser`, `CommandTracker` slices the output
    buffer between C and D, and the MCP response carries output + exit
-   code + cwd back to the AI. REPL adapters (python, node) install
-   hooks that emit the same OSC events — `sys.ps1.__str__` for
-   Python, `displayPrompt` + out-of-band `process.stdout.write` for
-   Node — so the tracker has exactly one code path for both shells
-   and REPLs.
+   code + cwd back to the AI. REPL adapters (python, node, racket)
+   install hooks that emit the same OSC events — `sys.ps1.__str__`
+   for Python, `displayPrompt` + out-of-band `process.stdout.write`
+   for Node, `current-prompt-read` override for Racket — so the
+   tracker has exactly one code path for both shells and REPLs.
 
 4. **External adapters override embedded ones.** At startup,
    `AdapterRegistry.LoadDefault()` merges `Splash.adapters.*.yaml`
@@ -133,65 +143,78 @@ given machine.
    interpreters (e.g. no zsh on this Windows box) are soft-skipped
    so CI stays green on partial toolchains. An adapter's `probe`
    runs as a synthetic first test — a broken adapter fails fast
-   instead of flooding the output with downstream failures.
+   instead of flooding the output with downstream failures. The
+   same probe loop is reachable standalone via
+   `splash --probe-adapters` (opt-in, no other tests).
 
 ---
 
 ## Next-session candidate work
 
-Roughly in order of payoff per risk, with the framework rationale:
+Phase C+ is clear. Roughly in order of payoff per risk:
 
-1. **Lisp-family REPL adapter (ghci / sbcl / clisp / racket)** —
-   the highest-information next step because it forces the schema
-   through `balanced_parens` (SCHEMA §18 Q1) and
-   `multiline_delivery: wrapper` (ghci's `:{ ... :}` form). Needs a
-   Lisp interpreter installed on the test box; if none are available,
-   downgrade to a machine that has one. Deliverable: `adapters/ghci.yaml`
-   or equivalent, a `ShellIntegration/integration.hs` or similar,
-   and the RegexPromptDetector finally wired into the worker for
-   strategy=regex adapters.
+1. **Runtime `balanced_parens` counter** — the unfinished half of
+   §18 Q1. The Racket adapter ships the schema fields but the
+   runtime does not consume `multiline_detect: balanced_parens`
+   at all; multi-line delivery bypasses the counter via tempfile.
+   Implementing it would let splash reject syntactically incomplete
+   AI input before submitting it to the REPL (preventing the
+   deadlock-on-unbalanced-paren failure mode). Minimum schema
+   additions needed:
+     - `balanced_parens.char_literal_prefix` (e.g. `'#\\'`) — next
+       char does not count toward bracket depth
+     - `balanced_parens.datum_comment_prefix` (e.g. `'#;'`) — next
+       balanced expression is skipped
+   Test against the reader-macro cases already in `racket.yaml`
+   tests. No breaking change to existing adapters — fields are
+   additive and gated on `multiline_detect == balanced_parens`.
 
-2. **Debugger adapter (gdb / pdb / lldb)** — exercises
-   `modes` + `exit_commands.effect` (SCHEMA §18 Q2). Bigger than
-   Lisp because `modes` is currently declarative-only — the worker
-   has no concept of "mode transition", so this requires runtime
-   plumbing on top of a new adapter. First version could stub
-   `modes` support behind a feature flag and grow it once the
-   pattern is clear.
+2. **Runtime `modes` graph walking** — the unfinished half of
+   §18 Q2. The python adapter declares pdb as an auto_enter mode
+   but ConsoleWorker does not walk the graph, enforce exit
+   commands, or emit mode-change events;
+   `AdapterDeclaredTestsRunner` treats `expect_mode` /
+   `expect_level` as deferred fields. Adding this is bigger than
+   the balanced_parens counter because it requires tracking
+   mode state across commands (which mode am I in now? did this
+   command trigger a mode change?). Good first step: emit a
+   `currentMode` field in the JSON response from `get_status`
+   and `execute`, populated by re-running the mode regexes
+   against the tail of the output buffer. Richer graph walking
+   (exit_commands enforcement, expect_mode assertions) can
+   follow as a second pass.
 
-3. **`probe.eval` at load time (opt-in CLI flag)** — quick health
-   check before the MCP server accepts connections. Small scope
-   (reuse `AdapterDeclaredTestsRunner`'s probe path), self-contained,
-   useful for catching broken adapters on startup instead of first
-   use. Gate behind `--probe-adapters` so default startup stays
-   fast.
+3. **More reader-macro-heavy Lisp adapters (SBCL / GHCi)** — stress
+   the Q1 fields further and provide a second evidence point for
+   Q4 (`balanced_parens: { preset: lisp }`). Requires installing
+   an interpreter (SBCL is smallest for CL; GHCi pulls in GHC
+   which is heavy). Defer until a test box already has one of
+   these toolchains.
 
-4. **`WaitForOutputSettled` timing from schema** — the last
-   hardcoded numbers in `ConsoleWorker` (`2s minimum + 1s stable +
-   30s deadline`). None of the current 6 adapters would tune these
-   but a Lisp adapter with a slow compiler startup might want to.
-   New schema fields: `ready.output_settled_min_ms`, `_max_ms`,
-   `_stable_ms`. Additive, non-breaking.
+4. **`CA1416` Registry.GetValue warning** — `ConsoleManager.cs:1922`
+   calls `Microsoft.Win32.Registry.GetValue` without a platform
+   guard, so the analyzer warns on every build. Add
+   `[SupportedOSPlatform("windows")]` on `GetRegistryPathExt` (and
+   `GetRegistryPath`) or wrap the call in an `OperatingSystem.IsWindows()`
+   check. Trivial — this is a "every rebuild prints the same
+   warning" papercut, not a correctness issue.
 
-5. **Fix UTF-8 BOM in splash's own `write_file` MCP tool.** Every
-   file Claude writes via `mcp__splash__write_file` gets a BOM
-   prepended, which pollutes commit-message subject lines unless
-   stripped before `git commit -F`. The fix belongs in `FileTools.cs`
-   (change the file-write to use `new UTF8Encoding(false)`), not in
-   every caller. Low risk but touches MCP wire behaviour — verify
-   that no consumer depends on the BOM.
+5. **Async-output handling (§18 Q3)** — `redraw_detect` is the
+   only defined strategy for `output.async_interleave.strategy`
+   and neither in-tree adapter exercises it. A future BEAM
+   (iex / erlang shell) or Go REPL adapter would surface whether
+   a single strategy covers both async families or if per-family
+   variants are needed. Blocked on adding one of those adapters.
 
-6. **Polish:** `--list-adapters` summary truncation for long
-   YAML `description: >` multi-line folds; `.gitattributes`
-   renormalisation of existing files via `git add --renormalize .`
-   (held off so far because it would touch every tracked file and
-   pollute blame history — do this only if there's a separate
-   reason to burn a blame entry).
+6. **`.gitattributes` renormalisation** — still held off. `git
+   add --renormalize .` would touch every tracked file and
+   pollute blame history. Do this only if there's a separate
+   reason to burn a blame entry. Not worth tackling in isolation.
 
 User policy as of 2026-04-14: **schema v1 remains unfrozen** —
-don't stamp `v1 stable` until at least one Lisp-family or debugger
-adapter has exercised the §18 open questions from evidence rather
-than theory.
+don't stamp `v1 stable` until the runtime `balanced_parens`
+counter and the `modes` graph walker both exist, even though the
+schema fields themselves are believed sufficient.
 
 ---
 
@@ -218,10 +241,26 @@ than theory.
   would flood OSC emission. `python.yaml` sets
   `process.env.PYTHON_BASIC_REPL=1` to force the old parser-based
   REPL where `sys.ps1` is evaluated exactly once per prompt.
-- **BOM in commit messages**: splash's `write_file` MCP tool emits
-  UTF-8 with BOM. Strip before `git commit -F`:
-  `$b = [IO.File]::ReadAllBytes($p); if ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { [IO.File]::WriteAllBytes($p, $b[3..($b.Length-1)]) }`
-  Track as a TODO to fix in the MCP tool itself; see candidate #5.
+- **Racket's `-i` REPL does NOT inherit `current-prompt-read`**
+  set during `-f` loading. Parameters are thread-local and the
+  interactive loop runs inside a fresh continuation barrier, so a
+  naive `racket -i -f integration.rkt` silently reverts to the
+  default `> ` prompt. Fix: the integration script calls
+  `(read-eval-print-loop)` itself after wiring up the parameter
+  — we drive the REPL from our own code rather than from the
+  binary's built-in `-i` path. See `adapters/racket.yaml` and
+  `ShellIntegration/integration.rkt`.
+- **BOM in commit messages**: FIXED in `fix(tools): write files
+  as UTF-8 without BOM`. `FileTools.cs` now uses a shared
+  `UTF8Encoding(false)` for every write, so `mcp__splash__write_file`
+  output pipes cleanly into `git commit -F`. Reads already
+  detect+strip BOM via `detectEncodingFromByteOrderMarks: true`
+  so round-tripping pre-BOM files still works.
+- **`mcp__splash__edit_file` on CRLF files**: the splash-dev MCP
+  tool's `edit_file` fails to match `old_string` on CRLF-terminated
+  files. Use Claude Code's built-in `Edit` tool for splash's own
+  source (which is CRLF per the .gitattributes text=auto policy)
+  until splash's edit_file normalises line endings before search.
 - **`NormalizeShellFamily` stays.** It looks like a hardcoded
   shell-family helper but it's the path-to-registry-key normaliser
   that `AdapterRegistry.Find` itself uses as a lookup key —
@@ -234,9 +273,17 @@ than theory.
 
 ## Commit history at a glance
 
-The phase B/C arc is ~15 commits, each a self-contained story:
+Phase B → C → C+ is ~22 commits, each a self-contained story.
+Newest first:
 
 ```
+589feff  docs(schema): resolve §18 Q1 and Q2 from adapter evidence
+aff1249  feat(python): declare pdb as an auto_enter debug mode
+bc68271  feat(adapters): ship Racket REPL adapter with OSC 633 via current-prompt-read
+48f5197  feat(cli): add --probe-adapters and truncate --list-adapters summary
+b946d3e  feat(schema): tune WaitForOutputSettled via adapter.ready.output_settled_*
+44de5c8  fix(tools): write files as UTF-8 without BOM
+73026ca  docs: add HANDOFF.md as the session entry-point document
 10459f2  feat(tests): run each adapter's probe as a pre-flight before tests
 9806574  feat(cli): add --list-adapters to print what the registry loaded
 c6d2732  chore(repo): add .gitattributes to normalize line endings
