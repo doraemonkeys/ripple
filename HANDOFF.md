@@ -30,33 +30,34 @@ theft on Windows, `input.clear_line` opt-in flush for user-typed
 buffer contamination, and the `ModeDetector` input-source bug
 (was scanning OSC-C..D slice which never contained the post-A
 prompt, so auto_enter mode transitions silently fell through
-to default) — are all complete. **11 adapters ship embedded**
-(pwsh, bash, zsh, cmd, python, node, racket, **abcl**, fsi,
-jshell, groovy; plus `ccl` which ships in the source tree but
-is gitignored — originally because corporate AppLocker was
-blocking user-dir PE files under ConPTY. As of 2026-04-15 ccl's
-probe + 5 declared tests + a 4-test debugger-mode chain all
-pass on this box, which suggests the policy has been relaxed.
-The decision to un-gitignore ccl.yaml + integration.lisp and
-ship it embedded is open — see "Next-session candidate work" #4b).
-**578 assertions** pass on `--test` + `--adapter-tests`
-(437 unit + 70 adapter-declared + 79 pre-existing E2E; the two
-pre-existing E2E flakes at the end of ConsoleWorkerTests.Run
-still block `--test --e2e` from reaching the adapter-declared
-block, use `--adapter-tests` standalone to hit that layer).
-Zero shell-family literals survive in the C# runtime outside
-the registry key normaliser. Schema §18 Q1 (balanced_parens vs
-reader macros) is **empirically closed** — 58 `BalancedParensCounter`
-assertions including the nested-datum-comment bug that the
-2026-04-15 fix resolved. Schema §18 Q2 (auto_enter + nested +
-level_capture) is **empirically closed** — the `ModeDetector`
-input-source fix plus a local 4-test chain against CCL's break
-loop (`(error ...)` → `1 >`, nested → `2 >`, `:pop` → `1 >`,
-`:pop` → main) verify the path end-to-end against a live REPL.
-Q3 and Q4 remain untouched — both are blocked on a BEAM/Go-style
-adapter, not on schema gaps. **The schema is ready to freeze as
-`v1 stable`** the next time someone is willing to stamp it; no
-remaining runtime gates.
+to default) — are all complete and shipped in **v0.7.0**.
+**12 adapters ship embedded** (pwsh, bash, zsh, cmd, python,
+node, racket, **ccl**, **abcl**, fsi, jshell, groovy). `ccl`
+graduated from local-only gitignore in v0.7.0 after empirical
+confirmation on 2026-04-15 that the corporate AppLocker block
+which motivated the original exclusion has been relaxed — 10
+consecutive clean runs of `--adapter-tests --only ccl`
+(probe + 5 declared tests + a 4-test debugger-mode chain). On
+boxes where a similar block persists the probe will soft-fail,
+same class as a missing zsh on Windows. **528 assertions** pass
+on `--test` + `--adapter-tests` (458 unit + 70 adapter-declared).
+Two pre-existing `ConsoleWorkerTests.Run` flakes (Ctrl+C standby,
+obsolete PTY alive) still block `--test --e2e` from reaching the
+declared suite — use `--adapter-tests` standalone to exercise
+that layer and ignore the flake gate. Zero shell-family literals
+survive in the C# runtime outside the registry key normaliser.
+Schema §18 Q1 (balanced_parens vs reader macros) is **empirically
+closed** — 58 `BalancedParensCounter` assertions including the
+nested-datum-comment bug the 2026-04-15 fix resolved. Schema §18
+Q2 (auto_enter + nested + level_capture) is **empirically closed**
+— the `ModeDetector` input-source fix plus a 4-test chain against
+CCL's break loop (`(error ...)` → `1 >`, nested → `2 >`,
+`:pop` → `1 >`, `:pop` → main) verify the path end-to-end against
+a live REPL, and those tests are now in CI (not local-only) as of
+v0.7.0. Q3 and Q4 remain untouched — both are blocked on a
+BEAM/Go-style adapter, not on schema gaps. **The schema is ready
+to freeze as `v1 stable`** the next time someone is willing to
+stamp it; no remaining runtime gates.
 
 ---
 

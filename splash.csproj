@@ -8,7 +8,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>splash</AssemblyName>
     <RootNamespace>Splash</RootNamespace>
-    <Version>0.5.0</Version>
+    <Version>0.7.0</Version>
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>
@@ -37,6 +37,7 @@
     <EmbeddedResource Include="ShellIntegration\integration.py" />
     <EmbeddedResource Include="ShellIntegration\integration.js" />
     <EmbeddedResource Include="ShellIntegration\integration.rkt" />
+    <EmbeddedResource Include="ShellIntegration\integration.lisp" />
     <EmbeddedResource Include="ShellIntegration\integration.abcl.lisp" />
     <EmbeddedResource Include="ShellIntegration\integration.fsx" />
     <EmbeddedResource Include="adapters\pwsh.yaml" />
@@ -46,6 +47,7 @@
     <EmbeddedResource Include="adapters\python.yaml" />
     <EmbeddedResource Include="adapters\node.yaml" />
     <EmbeddedResource Include="adapters\racket.yaml" />
+    <EmbeddedResource Include="adapters\ccl.yaml" />
     <EmbeddedResource Include="adapters\abcl.yaml" />
     <EmbeddedResource Include="adapters\fsi.yaml" />
     <EmbeddedResource Include="adapters\jshell.yaml" />

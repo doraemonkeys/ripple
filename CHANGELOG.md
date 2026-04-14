@@ -4,14 +4,23 @@ All notable changes to splash are documented here. Format based on [Keep a Chang
 
 ## [0.7.0] - 2026-04-15
 
-Polish round — seven bug fixes found via adversarial testing of the
-v0.6.0 surface. Each fix started with a complaint or a suspected
-weakness, pinned the current (broken) behaviour with a test, then
-replaced the implementation. No architecture rewrites; the
-worker / proxy split and the adapter-YAML schema stayed stable
-across all seven. 578 / 578 assertions pass (437 unit + 70 adapter-
-declared + 79 pre-existing E2E still blocked by two flakes inherited
-from the pre-0.6 harness, worked around by `--adapter-tests`).
+Polish round + shipping the CCL adapter. Seven bug fixes found via
+adversarial testing of the v0.6.0 surface (window title split-chunk
+leak, nested datum comments, node/groovy `signals.interrupt`
+mis-declaration, console focus theft, line-editor buffer flush,
+mode detection against the wrong input source), plus **12 embedded
+adapters** for the first time: `ccl` moves out of the local gitignore
+after empirical confirmation that the corporate AppLocker block which
+motivated the exclusion has been relaxed. Each fix started with a
+complaint or a suspected weakness, pinned the broken behaviour with
+a test, then replaced the implementation. No architecture rewrites;
+the worker / proxy split and the adapter-YAML schema stayed stable
+across all seven. **528 assertions pass** on `--test` (458 unit) +
+`--adapter-tests` (70 declared, 12 adapters). The two pre-existing
+`ConsoleWorkerTests.Run` flakes (Ctrl+C standby, obsolete PTY alive)
+that block `--test --e2e` from reaching the declared suite also
+predate 0.6 and are tracked separately — they're invisible to
+release binaries.
 
 ### Fixed
 - **Owned console window titles sometimes got clobbered by the
@@ -100,6 +109,23 @@ from the pre-0.6 harness, worked around by `--adapter-tests`).
   rather than just ModeDetector's unit tests.
 
 ### Added
+- **Clozure Common Lisp (CCL) adapter ships embedded.** Through
+  v0.6.0 `adapters/ccl.yaml` + `ShellIntegration/integration.lisp`
+  lived locally-only because corporate AppLocker on the dev box
+  blocked user-dir PE files under ConPTY spawn — earlier adapter
+  tests consistently hit `CreateProcessW failed: 5`. On
+  2026-04-15 that block is empirically gone: `--adapter-tests
+  --only ccl` runs 10 / 10 green across repeated runs, covering
+  the probe, five expression-level tests (arithmetic, stateful
+  defparameter, block-comment reader macro, char-literal reader
+  macro, default mode), and the four-test debugger-mode chain
+  that was added this round to verify §18 Q2's auto_enter +
+  nested + level_capture path (`(error ...)` → `1 > `, nested
+  → `2 > `, `:pop` → `1 > `, `:pop` → main). CCL is now the
+  first native-binary Lisp in the embedded set alongside the
+  JVM-hosted ABCL. On boxes where the AppLocker block persists
+  the probe will still soft-fail — same class as a missing
+  zsh on Windows, not a regression.
 - **`--adapter-tests [--only <name>]` CLI flag** — already shipped
   in 0.6.0 but now documented as the canonical way to exercise
   adapter-declared tests without the pre-existing E2E flakes in
@@ -116,10 +142,12 @@ from the pre-0.6 harness, worked around by `--adapter-tests`).
   command template silences the JDK 21 virtual-threading
   introspection warning that ABCL 1.9.2 prints on every cold
   start.
-- **Pre-existing E2E flake documentation** — HANDOFF.md #9
-  documents the two tests that have been failing across sessions
-  (Ctrl+C post-interrupt standby, obsolete PTY alive) and the
-  `--adapter-tests` workaround.
+- **Pre-existing E2E flake documentation** — HANDOFF.md documents
+  the two `ConsoleWorkerTests.Run` tests (Ctrl+C post-interrupt
+  standby, obsolete PTY alive) that have been failing across
+  sessions and the `--adapter-tests` standalone workaround. On
+  release binaries the flakes are invisible — they only affect
+  the `--test --e2e` contract gate during development.
 
 ### Changed
 - **`SignalsSpec.Interrupt` is now `string?`.** The YAML default

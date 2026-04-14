@@ -1,0 +1,209 @@
+schema: 1
+name: ccl
+version: 0.1.0
+description: >
+  Clozure Common Lisp REPL with OSC 633 shell-integration-style command
+  tracking. Second Lisp-family adapter (after racket); shipped as a CL
+  reference point for the BalancedParensCounter (CL has the same
+  reader-macro surface area for `#\(` char literals and `#|...|#` block
+  comments but lacks Racket's `#;` datum comments) and as the canonical
+  example of a nested debugger mode for SCHEMA §9 / §18 Q2 level_capture.
+  CCL's break loop emits prompts of the form `1 > `, `2 > `, ... at
+  successive nesting depths, matched by the debugger mode's
+  level_capture regex.
+homepage: https://github.com/Clozure/ccl
+license: Apache-2.0
+family: repl
+aliases:
+  - clozure
+  - clozure-cl
+
+process:
+  # `ccl --no-init --quiet --load integration.lisp` skips system init,
+  # suppresses the startup banner, loads our integration script (which
+  # installs the OSC-emitting prompt printer and then returns), then
+  # drops into the standard listener loop. Unlike Racket's `-i` flag,
+  # CCL's listener is started by the binary after --load returns and
+  # does honor parameter values set during load — so we don't need to
+  # call (read-eval-print-loop) ourselves.
+  command_template: '"{shell_path}" --no-init --quiet --load {init_invocation}'
+  inherit_environment: true
+  encoding: utf-8
+  # CCL's interactive reader on Windows treats \r as Enter via ConPTY
+  # cooked mode. Same convention as Python / Node / Racket.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  # CCL cold start is ~150ms after the heap image loads; no settle
+  # needed before the first prompt fires.
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  delay_after_inject_ms: 0
+
+init:
+  strategy: shell_integration
+  hook_type: prompt_variable        # ccl::print-listener-prompt override
+  delivery: launch_command
+  tempfile:
+    prefix: .splash-integration-
+    extension: .lisp
+  init_invocation_template: '"{tempfile_path}"'
+  script_resource: integration.lisp
+
+prompt:
+  strategy: shell_integration
+  shell_integration:
+    protocol: osc633
+    markers:
+      prompt_start: "A"
+      command_finished: "D"
+      property_update: "P"
+    property_updates:
+      cwd_key: Cwd
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  strip_input_echo: true
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  multiline_detect: balanced_parens
+  balanced_parens:
+    open: ['(', '[', '{']
+    close: [')', ']', '}']
+    string_delims: ['"']
+    escape: '\'
+    line_comment: ';'
+    block_comment: ['#|', '|#']
+    char_literal_prefix: '#\'
+    # Common Lisp does NOT have Racket's `#;` datum comment — the
+    # closest CL idiom is the `#+nil expr` reader conditional, which
+    # works through `read` without needing a counter extension because
+    # the conditional consumption happens inside CL's reader, not at
+    # splash's input layer. So no datum_comment_prefix here.
+  multiline_delivery: tempfile
+  tempfile:
+    prefix: .splash-exec-
+    extension: .lisp
+    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.lisp"
+    invocation_template: '(splash-exec-file "{path}")'
+  chunk_delay_ms: 0
+
+modes:
+  # Top-level CCL listener — the `?` prompt the user sees on a clean
+  # session. ModeDetector falls back to this when no auto_enter mode
+  # matches.
+  - name: main
+    default: true
+    primary: '^\? $'
+
+  # CCL break loop. Errors at the top level drop into a debugger that
+  # prints `1 > ` and accepts both ordinary expressions and the
+  # restart-selector commands (`:r`, `:pop`, `:abort`, `:continue`).
+  # Nested errors stack the prompt: `2 > `, `3 > `, etc. The level
+  # number matches `ccl::*break-level*` in the listener loop's
+  # dynamic environment, so the level_capture group on the detect
+  # regex tracks nesting depth without any worker-side state.
+  - name: debugger
+    auto_enter: true
+    nested: true
+    detect: '^(\d+) > $'
+    primary: '^(\d+) > $'
+    level_capture: 1
+    exit_commands:
+      - { command: ":pop",      effect: unwind_one_level }
+      - { command: ":abort",    effect: return_to_toplevel }
+      - { command: ":continue", effect: resume }
+      - { command: ":r 1",      effect: invoke_restart }
+    exit_detect: '^\? $'
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: "(quit)"
+    grace_ms: 1000
+    force_signal: kill
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: false
+  # CCL has the same auto_enter behavior as python's pdb mode — an
+  # error at the listener immediately drops into the debugger break
+  # loop without the user having to invoke anything. The runtime
+  # ModeDetector re-evaluates after every command, so the MCP client
+  # always sees the right currentMode / currentModeLevel.
+  auto_modes: true
+  async_output: false
+  exit_code: "unreliable"
+  cwd_tracking: true
+  cwd_format: windows_native
+  job_control: false
+  shell_integration: osc633
+  user_busy_detection: none
+
+probe:
+  eval: "(+ 1 1)"
+  expect: '^2$'
+
+tests:
+  - name: "integer arithmetic returns a value"
+    eval: "(* 21 2)"
+    expect: '42'
+
+  - name: "stateful: defparameter persists across commands"
+    setup_sequence:
+      - eval: "(defparameter *splash-test* 'persist-ok)"
+    eval: "*splash-test*"
+    expect: 'PERSIST-OK'
+
+  - name: "reader macro: block comment #| |# ignored"
+    eval: "(+ 1 #| nested |# 2)"
+    expect: '^3$'
+
+  - name: "char literal: #\\( is a character not an open paren"
+    eval: "(char-code #\\()"
+    expect: '40'
+
+  - name: "modes: top-level eval reports current mode as main"
+    eval: "(+ 1 1)"
+    expect: '2'
+    expect_mode: main
+
+  # The next four tests exercise the nested debugger mode's
+  # level_capture path end-to-end against a live CCL break loop.
+  # They're deliberately sequential — each relies on the REPL state
+  # left by the previous test — so the adapter-declared test runner
+  # walks them in declaration order and the chain bottoms out back
+  # at the main prompt so any follow-on tests start clean. This is
+  # the empirical evidence that SCHEMA §18 Q2's auto_enter + nested
+  # + level_capture triple actually works at runtime, rather than
+  # being declarative-only.
+  - name: "modes: (error ...) enters break loop at level 1"
+    eval: '(error "probe-level-1")'
+    expect_mode: debugger
+    expect_level: 1
+
+  - name: "modes: nested error captures level 2"
+    eval: '(error "probe-level-2")'
+    expect_mode: debugger
+    expect_level: 2
+
+  - name: "modes: :pop unwinds one level back to 1"
+    eval: ":pop"
+    expect_mode: debugger
+    expect_level: 1
+
+  - name: "modes: :pop from level 1 returns to main"
+    eval: ":pop"
+    expect_mode: main
