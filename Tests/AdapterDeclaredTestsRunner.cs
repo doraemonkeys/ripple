@@ -130,6 +130,42 @@ public static class AdapterDeclaredTestsRunner
                 return (pass, fail);
             }
 
+            // Run probe first (if declared) as a quick health check. The
+            // probe exists in schema §14 as "single eval + expected regex
+            // used as a load-time sanity check"; we repurpose it here as
+            // a pre-flight for the tests: block so an adapter with a
+            // fundamentally broken launch fails fast without burning
+            // time on the richer test suite.
+            if (adapter.Probe != null && !string.IsNullOrEmpty(adapter.Probe.Eval))
+            {
+                var probeTest = new AdapterTest
+                {
+                    Name = "probe",
+                    Eval = adapter.Probe.Eval,
+                    Expect = adapter.Probe.Expect,
+                };
+                try
+                {
+                    var ok = await RunOneTestAsync(pipeName, probeTest);
+                    Assert(ok, "probe");
+                    if (!ok)
+                    {
+                        // Probe failure usually means the interpreter
+                        // isn't responding as expected — the richer
+                        // tests: block below would just pile on
+                        // more failures. Bail out early.
+                        Console.Error.WriteLine($"  (skipping {adapter.Name}/tests — probe failed)");
+                        return (pass, fail);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"    {ex.GetType().Name}: {ex.Message}");
+                    Assert(false, "probe");
+                    return (pass, fail);
+                }
+            }
+
             foreach (var test in adapter.Tests!)
             {
                 try
@@ -218,7 +254,9 @@ public static class AdapterDeclaredTestsRunner
         // because ANSI codes are sprinkled between "ValueError" and the
         // colon. Strip ANSI before matching — the visible text is what
         // the adapter test is asserting against, not the wire format.
-        var output = StripAnsi(rawOutput);
+        // Also trim leading/trailing whitespace so a Node REPL's
+        // "\n2\n" output still matches a `^2$` anchored regex.
+        var output = StripAnsi(rawOutput).Trim();
 
         var cwdAfterEval = evalResp.TryGetProperty("cwd", out var cw) ? cw.GetString() : null;
         var exitCode = evalResp.TryGetProperty("exitCode", out var ec) ? ec.GetInt32() : 0;
@@ -231,7 +269,11 @@ public static class AdapterDeclaredTestsRunner
 
         if (!string.IsNullOrEmpty(test.Expect))
         {
-            var re = new Regex(test.Expect, RegexOptions.Singleline);
+            // Multiline so ^ and $ match line boundaries inside the
+            // command's output (e.g. a Node REPL produces "\n2\n" but
+            // the author wrote `^2$` expecting a line match). Singleline
+            // so `.` matches newlines for multi-line captures.
+            var re = new Regex(test.Expect, RegexOptions.Multiline | RegexOptions.Singleline);
             if (!re.IsMatch(output)) return false;
         }
 
