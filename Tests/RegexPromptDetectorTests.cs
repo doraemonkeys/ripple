@@ -108,6 +108,84 @@ public static class RegexPromptDetectorTests
                 $"irb counter increments, still matches (got {offsets2.Count})");
         }
 
+        // --- CSI-aware scenarios (fsi-style ConPTY rendering) ---
+        // These exercise the CSI strip + offset-translation path. The
+        // adapter author writes `^> $` against the visible text; the
+        // detector silently strips cursor positioning and color escapes
+        // before matching, then translates the match position back to
+        // the original-coordinate buffer the caller passes in.
+
+        // CSI noise around the prompt token (one chunk).
+        {
+            var d = new RegexPromptDetector(@"^> $");
+            var chunk = "\x1b[?25l\x1b[m it: int = 2\x1b[12;1H> \x1b[?25h";
+            var offsets = d.Scan(chunk);
+            Assert(offsets.Count == 1,
+                $"CSI: prompt with cursor positioning + show-cursor matches (got {offsets.Count})");
+            // The reported offset should land at the original-coordinate
+            // position right after the trailing \x1b[?25h (= chunk.Length),
+            // not at an internal byte position.
+            if (offsets.Count == 1)
+            {
+                Assert(offsets[0] == chunk.Length,
+                    $"CSI: offset is past trailing CSI (got {offsets[0]}, expected {chunk.Length})");
+            }
+        }
+
+        // CSI noise WITHOUT a `> ` token must not match `^> $`.
+        {
+            var d = new RegexPromptDetector(@"^> $");
+            var chunk = "\x1b[?25l\x1b[m it: int = 2\x1b[12;1H\x1b[?25h";  // no `> `
+            var offsets = d.Scan(chunk);
+            Assert(offsets.Count == 0,
+                $"CSI: chunk without `> ` does NOT match (got {offsets.Count})");
+        }
+
+        // Prompt arriving as a separate chunk after the CSI tail of the
+        // previous one. Buffer carry-over keeps the trailing CSI bytes
+        // so the next scan re-strips with the full context.
+        {
+            var d = new RegexPromptDetector(@"^> $");
+            // First chunk: result text + cursor positioning + show-cursor,
+            // but no `> `.
+            var off1 = d.Scan("\x1b[?25l it: int = 2\x1b[12;1H\x1b[?25h");
+            Assert(off1.Count == 0,
+                $"CSI: first chunk without `> ` does not match (got {off1.Count})");
+            // Second chunk: just the `> ` (with a leading color reset).
+            var off2 = d.Scan("\x1b[m> ");
+            Assert(off2.Count == 1,
+                $"CSI: `> ` arriving in next chunk matches via buffer (got {off2.Count})");
+        }
+
+        // Trailing `\n` after the prompt (some shells emit a fresh line
+        // before the prompt). Must still match `^> $` because $ in
+        // Multiline mode matches before \n.
+        {
+            var d = new RegexPromptDetector(@"^> $");
+            var offsets = d.Scan("\x1b[m> \n");
+            Assert(offsets.Count == 1,
+                $"CSI: prompt followed by newline matches (got {offsets.Count})");
+        }
+
+        // Color escapes interleaved with the prompt characters
+        // themselves (defensive: some REPLs colorize the prompt).
+        {
+            var d = new RegexPromptDetector(@"^> $");
+            var chunk = "\x1b[38;5;15m> \x1b[m";
+            var offsets = d.Scan(chunk);
+            Assert(offsets.Count == 1,
+                $"CSI: colorized `> ` strips to plain `> ` and matches (got {offsets.Count})");
+        }
+
+        // Pattern with a literal non-ASCII anchor character (not a CSI
+        // case but verifies the strip pass doesn't mangle plain text).
+        {
+            var d = new RegexPromptDetector(@"λ> $");
+            var offsets = d.Scan("\x1b[mλ> \n");
+            Assert(offsets.Count == 1,
+                $"CSI: lambda prompt stripped of CSI matches (got {offsets.Count})");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
