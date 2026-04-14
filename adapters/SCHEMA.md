@@ -94,6 +94,9 @@ ready:
   suppress_mirror_during_inject: true
   kick_enter_after_ready: true
   delay_after_inject_ms: 500
+  output_settled_min_ms: 2000
+  output_settled_stable_ms: 1000
+  output_settled_max_ms: 30000
 ```
 
 - **`wait_for_event`** — `prompt_start` | `marker` | `regex` | `custom`. For
@@ -109,6 +112,13 @@ ready:
 - **`kick_enter_after_ready`** — send an Enter keystroke once ready to force a
   fresh prompt redraw (needed for shells whose initial prompt was suppressed
   by injection).
+- **`output_settled_{min,stable,max}_ms`** — tuning knobs for the worker's
+  `WaitForOutputSettled` drain phase. `min_ms` is the absolute minimum wait
+  before polling starts; `stable_ms` is the consecutive quiet window
+  required to declare output settled; `max_ms` is the hard deadline.
+  Defaults 2000 / 1000 / 30000 match the pre-schema hardcoded behavior.
+  Slow-compiler REPLs (Lisp, Haskell) may need to raise `max_ms`; fast
+  REPLs can lower `min_ms` to speed startup.
 
 ---
 

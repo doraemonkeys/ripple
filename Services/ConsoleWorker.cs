@@ -577,22 +577,31 @@ public class ConsoleWorker
 
     private async Task WaitForOutputSettled(CancellationToken ct)
     {
-        // Wait for output to settle: no new data for 1 second, with minimum 2s wait.
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        // Timings come from adapter.ready.output_settled_* (schema v1), with
+        // the pre-schema hardcoded 2s/1s/30s as the ReadySpec defaults.
+        var ready = _adapter?.Ready;
+        int minMs    = ready?.OutputSettledMinMs    ?? 2000;
+        int stableMs = ready?.OutputSettledStableMs ?? 1000;
+        int maxMs    = ready?.OutputSettledMaxMs    ?? 30000;
+
+        int pollMs = Math.Max(50, stableMs / 2);
+        int requiredConsecutive = Math.Max(1, (int)Math.Ceiling(stableMs / (double)pollMs));
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(maxMs);
         var lastLength = 0;
         var settledCount = 0;
-        await Task.Delay(2000, ct); // minimum wait
+        await Task.Delay(minMs, ct);
 
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
-            await Task.Delay(500, ct);
+            await Task.Delay(pollMs, ct);
 
             var currentLength = _outputLength;
             if (currentLength == lastLength && currentLength > 0)
             {
                 settledCount++;
-                if (settledCount >= 2) break; // settled for 1s
+                if (settledCount >= requiredConsecutive) break;
             }
             else
             {

@@ -60,6 +60,13 @@ public class ReadySpec
     public bool SuppressMirrorDuringInject { get; set; }
     public bool KickEnterAfterReady { get; set; }
     public int DelayAfterInjectMs { get; set; }
+
+    // WaitForOutputSettled tuning — see ConsoleWorker.WaitForOutputSettled.
+    // Defaults match the pre-schema hardcoded values so omitting these in
+    // existing adapters is a no-op.
+    public int OutputSettledMinMs { get; set; } = 2000;
+    public int OutputSettledStableMs { get; set; } = 1000;
+    public int OutputSettledMaxMs { get; set; } = 30000;
 }
 
 public class InitSpec
