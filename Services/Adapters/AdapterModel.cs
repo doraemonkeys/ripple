@@ -214,6 +214,24 @@ public class BalancedParensSpec
     public string? Escape { get; set; }
     public string? LineComment { get; set; }
     public List<string>? BlockComment { get; set; }
+
+    /// <summary>
+    /// Reader-macro char literal prefix (e.g. Racket's <c>#\</c>).
+    /// The character immediately after this prefix is consumed
+    /// verbatim and never contributes to bracket depth, so
+    /// <c>#\(</c> is treated as a literal open paren token rather
+    /// than an unclosed bracket. Schema §18 Q1 extension.
+    /// </summary>
+    public string? CharLiteralPrefix { get; set; }
+
+    /// <summary>
+    /// Reader-macro datum comment prefix (e.g. Racket's <c>#;</c>).
+    /// The next balanced expression after this prefix is skipped
+    /// entirely — brackets inside are still balanced, but the
+    /// whole sub-expression does not contribute to the outer
+    /// depth count. Schema §18 Q1 extension.
+    /// </summary>
+    public string? DatumCommentPrefix { get; set; }
 }
 
 public class ModeSpec

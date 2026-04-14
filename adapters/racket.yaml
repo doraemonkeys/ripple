@@ -71,12 +71,14 @@ output:
 
 input:
   line_ending: "\r"
-  # Schema §18 Q1 observation: balanced_parens is declared here so the
-  # adapter exercises the schema field, but the runtime does not yet
-  # consume MultilineDetect — it's a gating pre-check that Phase D will
-  # add. Until then, multi-line REPL blocks go through tempfile delivery
-  # (the same path python uses for def/class bodies), so command
-  # boundaries stay clean regardless of reader-macro complications.
+  # Pre-send syntactic gate. When the AI sends a block through the
+  # execute path, ConsoleWorker runs BalancedParensCounter before
+  # writing anything to the PTY — an unbalanced expression like
+  # `(define (f x)` is rejected with a clear diagnostic rather than
+  # deadlocking the REPL waiting for the closing paren. Reader macros
+  # that broke naive counting in earlier drafts now have explicit
+  # schema extensions (char_literal_prefix for `#\(` / `#\)`, and
+  # datum_comment_prefix for `#;` skipped datums). See SCHEMA.md §18 Q1.
   multiline_detect: balanced_parens
   balanced_parens:
     open: ['(', '[', '{']
@@ -85,6 +87,8 @@ input:
     escape: '\'
     line_comment: ';'
     block_comment: ['#|', '|#']
+    char_literal_prefix: '#\'
+    datum_comment_prefix: '#;'
   multiline_delivery: tempfile
   tempfile:
     prefix: .splash-exec-

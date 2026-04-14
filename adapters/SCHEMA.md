@@ -286,6 +286,8 @@ input:
     escape: '\'
     line_comment: ';'
     block_comment: ['#|', '|#']
+    char_literal_prefix: '#\'        # reader-macro: #\( is not an open paren
+    datum_comment_prefix: '#;'       # reader-macro: #;expr skips next datum
   tempfile:
     prefix: .splash-exec-
     extension: .ps1
@@ -315,6 +317,17 @@ input:
 - **`tempfile.history_filter`** — regex matched against shell history entries.
   Lines matching this are hidden from shell history so splash's
   implementation detail doesn't pollute the user's `Up-arrow` recall.
+- **`balanced_parens.char_literal_prefix`** — reader-macro prefix that
+  escapes a single character from bracket counting (Racket's `#\`,
+  Common Lisp's `#\`, Scheme's `#\`). The counter consumes the prefix,
+  the following character, and any trailing identifier characters
+  (so named literals like `#\space` are handled), and does NOT treat
+  embedded brackets inside the literal as syntactic parens.
+- **`balanced_parens.datum_comment_prefix`** — reader-macro prefix that
+  skips the next balanced datum entirely (Racket / R6RS Scheme `#;`).
+  The counter tracks pending datum comments and resolves them when
+  the next atom, string, or matching close bracket appears. Multiple
+  `#;` may stack (`#;#;(a)(b)` skips two following datums).
 
 ---
 
@@ -507,27 +520,35 @@ Supported assertions:
 
 ## 18. Open questions for v1 freeze
 
-- [~] **Q1: Is `balanced_parens` expressive enough for Lisp-family
-  languages with reader macros?** — Partially answered by the Racket
-  adapter (0.1.0, 2026-04-14). The schema fields (`open`, `close`,
-  `string_delims`, `escape`, `line_comment`, `block_comment`) cover the
-  obvious tokens but NOT the reader-macro escapes that appear in real
-  Lisp code: `#;` (datum comment — skips the next datum, paren-aware),
-  `#|…|#` (the existing `block_comment` handles this), `#\(` and `#\)`
-  (character literals of parens — must not count toward bracket depth),
-  and `'`/`` ` ``/`,@` quoting prefixes that prefix sub-expressions
-  without opening brackets. The Racket adapter ships with
-  `balanced_parens` declared for schema forward-compat, but the current
-  runtime does NOT consume `multiline_detect` at all — multi-line
-  delivery goes through the same `tempfile` path Python uses, which
-  sidesteps the question entirely. A runtime counter would need at
-  minimum a `char_literal_prefix: '#\\'` field to skip the next
-  character, and a `datum_comment_prefix: '#;'` field to skip the next
-  balanced expression. Until such a runtime counter exists and is
-  tested against reader-macro-heavy input, treat Q1 as "schema fields
-  are believed sufficient for everything except char literals and
-  datum comments." Deferring a v1 freeze until those two extensions
-  ship keeps the door open without breaking adapters.
+- [x] **Q1: Is `balanced_parens` expressive enough for Lisp-family
+  languages with reader macros?** — Answered "yes, with the
+  char_literal_prefix + datum_comment_prefix extensions" by the
+  Racket adapter + runtime counter (0.1.0 → 0.2.0, 2026-04-14).
+  The counter (`Services/BalancedParensCounter.cs`) is a single
+  forward pass that tracks bracket depth, string-literal state,
+  line/block comment state, and the two reader-macro extensions
+  added to close Q1:
+    - **`char_literal_prefix`** consumes the prefix + the next
+      character (plus any identifier run for named literals like
+      `#\space`), so `#\(` is treated as a literal char token
+      rather than an unclosed open paren.
+    - **`datum_comment_prefix`** pushes a pending-comment marker
+      that is resolved when the next atom / string / matching
+      close bracket appears, so `#;(long list)` balances its
+      own brackets without affecting outer depth. Multiple `#;`
+      stack (`#;#;(a)(b)` skips two datums) via a counter.
+  The counter ships with 26 unit tests covering all the Lisp
+  edge cases (char literals of every bracket type, datum
+  comments on atoms / strings / lists, nested datum comments,
+  strings with embedded brackets, unterminated literals). The
+  Racket adapter's `multiline_detect: balanced_parens` is now
+  wired into `ConsoleWorker`'s execute path: an AI-sent block
+  that fails the counter (`(define (f x)`, `(+ 1 2))`, etc.) is
+  rejected with a clear diagnostic rather than being submitted
+  to the REPL where it would deadlock. The quoting prefixes
+  `'` / `` ` `` / `,@` don't need schema support because they
+  don't affect bracket counting — they just annotate the next
+  datum, which the counter already handles.
 - [x] **Q2: Should `modes.exit_commands.effect` enum stay closed (4
   values) or allow `custom` with a free-text label?** — Answered
   "closed is sufficient" by the python adapter's pdb mode declaration

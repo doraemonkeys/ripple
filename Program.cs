@@ -70,6 +70,7 @@ public class Program
             Tests.ConsoleManagerTests.Run();
             Tests.ConsoleWorkerTests.RunUnitTests();
             Tests.RegexPromptDetectorTests.Run();
+            Tests.BalancedParensCounterTests.Run();
             Tests.AdapterLoaderTests.Run(registry, adapterReport);
             if (args.Contains("--e2e"))
             {

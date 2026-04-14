@@ -1673,6 +1673,33 @@ public class ConsoleWorker
         if (_tracker.Busy)
             return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
 
+        // Pre-send syntactic gate for adapters that declare
+        // multiline_detect: balanced_parens (Racket today, future Lisp
+        // family). Catches AI mistakes like a half-finished
+        // (define (f x) before they deadlock the REPL waiting for the
+        // closing paren. The counter understands string literals, line
+        // and block comments, and the schema §18 Q1 reader-macro
+        // extensions (char_literal_prefix, datum_comment_prefix).
+        //
+        // Only gates when the adapter asks for it — every other
+        // adapter's execute path is untouched.
+        if (_adapter?.Input.MultilineDetect == "balanced_parens"
+            && _adapter.Input.BalancedParens is { } bpSpec)
+        {
+            var check = BalancedParensCounter.Evaluate(bpSpec, command);
+            if (!check.IsComplete)
+            {
+                var diag = check.Diagnostic ?? "syntactically incomplete input";
+                return SerializeResponse(w =>
+                {
+                    w.WriteString("status", "error");
+                    w.WriteString("error", "incomplete_input");
+                    w.WriteString("message", diag);
+                    w.WriteString("command", command);
+                });
+            }
+        }
+
         var shellName = _shellFamily;
         var enter = _adapter?.Input.LineEnding
             ?? _defaultEnter;
