@@ -2066,14 +2066,54 @@ public class ConsoleWorker
                 cleanedOutput = StripCmdInputEcho(cleanedOutput, echoExpected);
             }
             // Re-evaluate which mode the REPL is now in. The detector
-            // scans the tail of the captured output against every
+            // scans the tail of recent terminal output against every
             // auto_enter mode's detect regex; falls back to the
             // adapter's default mode otherwise. Result is cached on
-            // the worker so get_status / cached_output can report
-            // the same value without re-scanning.
+            // the worker so get_status / cached_output can report the
+            // same value without re-scanning.
+            //
+            // Scans the recent-output ring rather than the OSC-C..D
+            // slice because the mode transition is visible in the
+            // NEXT prompt (e.g. CCL drops to `1 > ` after an error),
+            // which arrives AFTER the OSC A that fires Resolve — so
+            // it's never inside cleanedOutput. The ring is updated
+            // unconditionally by FeedOutput and captures the post-A
+            // prompt as soon as its bytes land. Because ConPTY
+            // typically delivers OSC A and the following prompt
+            // bytes in the same chunk, the ring has the new prompt
+            // by the time we read it; a short poll with a fresh
+            // ring snapshot on each tick covers the rare case where
+            // the prompt trails by a few milliseconds.
             if (_adapter?.Modes is { Count: > 0 } modes)
             {
-                var match = ModeDetector.Detect(modes, cleanedOutput ?? "");
+                ModeMatch match = default;
+                string? defaultModeName = null;
+                foreach (var m in modes)
+                {
+                    if (m.Default) { defaultModeName = m.Name; break; }
+                }
+                defaultModeName ??= modes[0].Name;
+
+                var deadline = DateTime.UtcNow.AddMilliseconds(150);
+                while (true)
+                {
+                    // Scan the RAW ring bytes rather than the VtLite-
+                    // rendered snapshot. VtLite reshapes the terminal
+                    // grid and may collapse the post-A prompt into a
+                    // cell position that no longer matches the mode's
+                    // anchored regex (`^<prompt>$`). The raw stream
+                    // preserves the prompt as its own final line, which
+                    // is what the adapter-author wrote the regex
+                    // against.
+                    var snap = _tracker.GetRawRecentBytes();
+                    match = ModeDetector.Detect(modes, snap);
+                    // Stop as soon as we see a non-default auto_enter
+                    // mode match — that's the signal the REPL moved.
+                    if (match.Name != null && match.Name != defaultModeName) break;
+                    if (DateTime.UtcNow >= deadline) break;
+                    try { await Task.Delay(15, ct); }
+                    catch (OperationCanceledException) { break; }
+                }
                 _currentMode = match.Name;
                 _currentModeLevel = match.Level;
             }

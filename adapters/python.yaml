@@ -130,6 +130,19 @@ modes:
   # the python prompt in this adapter's context, so the 4-value
   # effect enum (resume / return_to_toplevel) is sufficient — no need
   # for `custom` yet. See SCHEMA.md §18 Q2.
+  #
+  # NOTE: this declaration is currently **declarative-only**. pdb's
+  # input loop bypasses `sys.ps1`, so the integration script's OSC-
+  # emitting prompt hook never fires for `(Pdb) `. An execute_command
+  # that triggers pdb.set_trace() times out because splash's tracker
+  # never sees an OSC A after the transition. Live verification of
+  # auto_enter + level_capture runs against CCL's break loop instead
+  # (ccl.yaml has the `modes: (error ...) enters break loop at level 1`
+  # test chain and its `level 2` / `:pop` siblings). Closing this gap
+  # would require integration.py to install a pdb-aware hook — either
+  # via `sys.monitoring` or by subclassing `pdb.Pdb` — so the nested
+  # prompt fires OSC 633 too. Deferred until there's a concrete AI
+  # workflow that needs pdb tracking at runtime.
   - name: pdb
     auto_enter: true
     detect: '^\(Pdb\) $'
