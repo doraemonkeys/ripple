@@ -2,6 +2,141 @@
 
 All notable changes to splash are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-04-15
+
+Polish round — seven bug fixes found via adversarial testing of the
+v0.6.0 surface. Each fix started with a complaint or a suspected
+weakness, pinned the current (broken) behaviour with a test, then
+replaced the implementation. No architecture rewrites; the
+worker / proxy split and the adapter-YAML schema stayed stable
+across all seven. 578 / 578 assertions pass (437 unit + 70 adapter-
+declared + 79 pre-existing E2E still blocked by two flakes inherited
+from the pre-0.6 harness, worked around by `--adapter-tests`).
+
+### Fixed
+- **Owned console window titles sometimes got clobbered by the
+  shell.** The read-loop's `ReplaceOscTitle` was stateless and
+  couldn't handle an OSC 0/1/2 title sequence that straddled a PTY
+  read-chunk boundary — the partial opener leaked to the visible
+  terminal and the terminal interpreted bytes 1..N as the shell's
+  title up to whatever terminator eventually arrived, clobbering
+  splash's desired title. Fix (commit `737f0a3`): add a
+  `ref string pendingTail` parameter so the unterminated opener is
+  buffered on `_oscTitlePending` and reassembled on the next chunk.
+  37 new unit assertions cover split points between `\e` and `]`,
+  between `]` and the type byte, mid-body, right at the terminator,
+  at the ST two-byte terminator, and with non-title OSCs
+  (633, 7, 112) flowing through untouched.
+- **`#;#;(a)` reported complete when it needed a second datum.**
+  The BalancedParensCounter's atom-run-consume branch was
+  decrementing `pendingDatumComments` on atoms inside a
+  datum-commented list — atoms that were already being skipped by
+  the list's own bracket accounting. Stacked datum-comment
+  prefixes with only one following datum therefore silently
+  resolved and the counter reported "submit-ready" when it should
+  have held. Fix (commit `39b6a83`): gate the atom-run branch on
+  `datumCommentAnchorDepths.Count == 0` so inner atoms don't
+  resolve outer prefixes. 32 new stress assertions harden the
+  counter against reader-macro pathologies: char literals of
+  quote / semicolon / pipe / backslash, bracket type mismatch
+  (pinned as a known gap), multi-line strings, 200-deep nesting,
+  quasi-quote, CL `#+nil` passthrough, and the fixed nested
+  datum-comment scenarios.
+- **Node / groovy mis-declared `signals.interrupt`.** Live
+  verification of all 10 adapters' interrupt handlers found two
+  that lied about their capability: Node's REPL cannot handle
+  Ctrl-C while its event loop is blocked by a sync JS loop or
+  pending top-level await (the signal handler runs on the same
+  thread), and groovysh's Ctrl-C is destructive — it terminates
+  the JVM and closes the shell outright. Fix (commit `f19f3c1`):
+  flip `capabilities.interrupt` to `false` for both, set
+  groovy's `signals.interrupt` to `null` so MCP clients don't
+  even try `send_input "\x03"`, and extend SCHEMA §11 with
+  nullable-interrupt semantics. Also: SignalsSpec.Interrupt is
+  now `string?` to support explicit `null` in YAML.
+- **New console windows stole keyboard focus.** `CreateProcessW`
+  with only `CREATE_NEW_CONSOLE` gives the new console active-
+  window status by default, so starting a splash shell while
+  the user is typing in their editor drops their keystrokes
+  into splash's buffer. Fix (commit `c90d3f1`): set
+  `STARTF_USESHOWWINDOW | wShowWindow = SW_SHOWNOACTIVATE` in
+  `STARTUPINFOW` so the new window is displayed but not
+  activated. The user's editor keeps focus.
+- **User-typed bytes were prepended to the next AI command.** Even
+  with the focus fix, users occasionally click into a splash
+  console and type a few keystrokes before noticing. Without a
+  flush, those bytes sit in the shell's line-editor buffer and
+  get submitted together with the next AI command as one garbled
+  line. Fix (same commit `c90d3f1`): new `input.clear_line`
+  schema field carries the bytes to write before each execute
+  to wipe the current line. Default is `null` (opt-in per
+  adapter) because Python `PYTHON_BASIC_REPL=1`, fsi
+  `--readline-`, Racket `-i`, CCL, and ABCL deliberately run
+  without a line editor and would parse the obvious `\x01\x0b`
+  (Ctrl-A + Ctrl-K) as literal input — empirical probe against
+  Python basic REPL produced
+  `SyntaxError: invalid non-printable character U+0001`. Opted
+  in for bash and zsh where readline / ZLE emacs defaults
+  handle the bytes as no-ops on an empty buffer. Eight schema
+  pins in AdapterLoaderTests lock the per-adapter expectations.
+- **`ModeDetector` never saw the post-OSC-A prompt, so every
+  mode transition silently fell through to the default.** The
+  auto_enter + nested + level_capture machinery was scanning
+  `cleanedOutput` (the OSC-C..D slice) for the mode's detect
+  regex. But the mode transition signal lives in the NEXT
+  prompt — `1 > ` for CCL's break loop, `(Pdb) ` for Python,
+  `N] ` for SBCL — which arrives AFTER OSC A fires Resolve, so
+  `cleanedOutput` literally can never contain it. And the
+  obvious alternative (`GetRecentOutputSnapshot()`) routes the
+  ring through VtLite, which reshapes the trailing prompt into
+  cell-addressed coordinates that break `^<prompt>$` anchored
+  regexes. Fix (commit `ca78f95`): scan `GetRawRecentBytes()`
+  in a short 150 ms poll loop, breaking out as soon as a
+  non-default auto_enter mode matches. Verified empirically
+  against a local 4-test chain walking CCL's break loop
+  (`(error ...)` → `1 >` → nested → `2 >` → `:pop` → `1 >` →
+  `:pop` → main). Schema §18 Q2 ("auto_enter + nested +
+  level_capture at runtime") is now backed by runtime evidence
+  rather than just ModeDetector's unit tests.
+
+### Added
+- **`--adapter-tests [--only <name>]` CLI flag** — already shipped
+  in 0.6.0 but now documented as the canonical way to exercise
+  adapter-declared tests without the pre-existing E2E flakes in
+  `ConsoleWorkerTests.Run` hard-exiting the process. Useful after
+  adding a new adapter to verify just its own tests in isolation.
+- **`input.clear_line` schema field** — documented in SCHEMA.md §8
+  alongside the empirical-verification requirement ("walk the
+  adapter in splash, type into its console window, run
+  execute_command, confirm the clear bytes wipe the buffer
+  without syntax errors, then add the field"). Bash and zsh opt-in;
+  everything else null by default.
+- **ABCL 1.9.2 adapter gotcha** in HANDOFF.md — the `--add-opens
+  java.base/java.lang=ALL-UNNAMED` flag on the Groovy-pattern
+  command template silences the JDK 21 virtual-threading
+  introspection warning that ABCL 1.9.2 prints on every cold
+  start.
+- **Pre-existing E2E flake documentation** — HANDOFF.md #9
+  documents the two tests that have been failing across sessions
+  (Ctrl+C post-interrupt standby, obsolete PTY alive) and the
+  `--adapter-tests` workaround.
+
+### Changed
+- **`SignalsSpec.Interrupt` is now `string?`.** The YAML default
+  stays `"\x03"` for adapters that omit the field, but adapters
+  with destructive Ctrl-C handlers (groovy today, future hosts
+  that kill the process on Ctrl-C) can now set `interrupt: null`
+  in YAML to signal "no safe interrupt byte available".
+- **Mode detection poll window.** `ConsoleWorker.HandleExecuteAsync`
+  now waits up to 150 ms for a non-default auto_enter mode to
+  appear in the raw ring after a command resolves. Happy path
+  (default mode) returns immediately; transitions that need the
+  post-A prompt bytes to arrive get up to 150 ms of headroom.
+- **`capabilities.interrupt`** for node and groovy flipped to
+  `false`. MCP clients querying the flag now see the honest
+  story: sending Ctrl-C to either host will NOT rescue a runaway
+  command.
+
 ## [0.6.0] - 2026-04-15
 
 Cache-on-busy-receive salvage layer plus a second Common Lisp adapter. When a command is in flight and the MCP client silently drops the response channel — ESC cancel, the MCP protocol's 3-minute ceiling, or a fresh tool call sneaking in on the same console — the worker flips the in-flight command to cache-on-complete mode so its eventual result lands in a per-console list instead of being silently discarded. The next tool call — **any** tool call, not just execute_command — drains the list and surfaces the result to the AI. Mirrors the PowerShell.MCP pattern, then closes three implementation holes observed in its reference. And: **Armed Bear Common Lisp** (ABCL) joins the embedded adapter set, giving splash a JVM-hosted Lisp reference point for the `balanced_parens` counter and proving the **Groovy pattern** (java.exe from a whitelisted Program Files path loading a jar payload from `%LocalAppData%`) works for any future JVM-hosted REPL. 536 / 536 test assertions pass (408 unit + 79 pre-existing E2E + 49 adapter-declared).
