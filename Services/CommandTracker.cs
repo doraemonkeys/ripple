@@ -1250,8 +1250,10 @@ public class CommandTracker
         // cmd: "<drive>:\...>"
         if (line.Length >= 2 && line[1] == ':' && line.EndsWith(">")) return true;
         // bash/zsh/fish: ends with $, #, %, >, ❯, λ
+        // ccl/abcl top-level: ends with ? (other Common Lisp REPL prompts)
         if (line.EndsWith('$') || line.EndsWith('#') || line.EndsWith('%') ||
-            line.EndsWith('>') || line.EndsWith('❯') || line.EndsWith('λ'))
+            line.EndsWith('>') || line.EndsWith('❯') || line.EndsWith('λ') ||
+            line.EndsWith('?'))
             return true;
         return false;
     }
