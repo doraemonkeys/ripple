@@ -2166,7 +2166,14 @@ public class ConsoleWorker
             // the prompt trails by a few milliseconds.
             if (_adapter?.Modes is { Count: > 0 } modes)
             {
-                ModeMatch match = default;
+                // Start with an explicit "no match yet" ModeMatch rather
+                // than `default` — records are reference types, so `default`
+                // is null and the compiler (rightly) can't prove the while
+                // loop reassigns it before the post-loop `match.Name`
+                // access. The loop body always runs at least once and
+                // overwrites this value, but flowing through a non-null
+                // sentinel makes the safety invariant explicit.
+                var match = new ModeMatch(Name: null, Level: null);
                 string? defaultModeName = null;
                 foreach (var m in modes)
                 {
