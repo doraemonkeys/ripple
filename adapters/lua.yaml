@@ -1,0 +1,131 @@
+schema: 1
+name: lua
+version: 0.1.0
+description: >
+  Lua's standard command-line interpreter driven as a splash REPL
+  adapter. Interactive mode is entered by launching `lua` with no
+  script argument. Primary prompt is `> `, continuation is `>> `
+  when a statement spans multiple lines. Used for quick Lua evaluation
+  and teaching — game engines and embedded systems that ship a
+  Lua runtime often have this exact REPL on hand.
+
+  Lua is a single-value-at-a-time language: `SELECT 1+1` equivalent
+  in Lua is `print(1+1)` — bare expressions at the prompt return
+  values only when prefixed with `=` (Lua 5.3+: `= 1+1` → `2`). The
+  adapter description notes this so AI agents don't fall into the
+  "my expression printed nothing" trap.
+homepage: https://www.lua.org/
+license: MIT
+family: repl
+aliases:
+  - lua5
+  - lua54
+
+process:
+  executable_candidates:
+    - lua
+    - lua5.4
+    - lua5.3
+    - lua54
+    # winget DEVCOM.Lua install location on Windows.
+    - '%LOCALAPPDATA%\Programs\Lua\bin\lua.exe'
+    - 'C:\Program Files\Lua\bin\lua.exe'
+    - 'C:\Lua\bin\lua.exe'
+    # Linux / macOS system installs.
+    - /usr/bin/lua
+    - /usr/bin/lua5.4
+    - /usr/local/bin/lua
+    - /opt/homebrew/bin/lua
+  command_template: '"{shell_path}"'
+  inherit_environment: true
+  encoding: utf-8
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  # Lua prints a one-line banner then the `> ` prompt. Short settle.
+  delay_after_inject_ms: 200
+
+init:
+  strategy: none
+  hook_type: none
+  delivery: none
+
+prompt:
+  # Lua's primary prompt is `> ` at line start. Continuation is `>> `
+  # but splash sends statements as single lines so the continuation
+  # case doesn't arise for adapter-driven commands.
+  strategy: regex
+  primary: '^> $'
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  strip_input_echo: true
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  multiline_detect: none
+  multiline_delivery: direct
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    # `os.exit()` is the Lua-idiomatic exit; EOF (Ctrl-D) also works
+    # but `os.exit()` is more explicit and survives being sent through
+    # a cooked-mode PTY as a line.
+    command: "os.exit()"
+    grace_ms: 500
+    force_signal: kill
+
+capabilities:
+  stateful: true           # global variables persist across prompts
+  interrupt: true
+  meta_commands: false     # Lua REPL has no dot-commands
+  async_output: false
+  exit_code: "unreliable"
+  cwd_tracking: false
+  cwd_format: "none"
+  job_control: false
+  shell_integration: null
+  user_busy_detection: none
+
+probe:
+  # `=` prefix is Lua 5.3+ shorthand for `return`, which the REPL
+  # prints. Equivalent to `print(1+1)`.
+  eval: "=1+1"
+  expect: '^2$'
+
+tests:
+  - name: "integer arithmetic via = prefix"
+    eval: "=21 * 2"
+    expect: '^42$'
+
+  - name: "print string"
+    eval: 'print("hello-world")'
+    expect: '^hello-world$'
+
+  - name: "state: global variable persists across commands"
+    setup_sequence:
+      - eval: "splash_test = 100"
+    eval: "=splash_test + 1"
+    expect: '^101$'
+
+  - name: "built-in function: string.upper"
+    eval: '=string.upper("splash")'
+    expect: '^SPLASH$'
+
+  - name: "table construction and length"
+    eval: "=#{1,2,3,4,5}"
+    expect: '^5$'
