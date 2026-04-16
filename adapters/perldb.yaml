@@ -1,0 +1,267 @@
+schema: 1
+name: perldb
+version: 0.1.0
+description: >
+  Perl's built-in debugger (perl5db.pl) driven as a REPL adapter. Launched
+  via `perl -de 0` — the trivial `0;` program drops perl straight to its
+  debugger prompt without loading any user script, giving us a scriptless
+  debugger REPL suitable for smoke tests and interactive inspection. The
+  prompt is `  DB<N> ` with a monotonic command counter. First
+  `family: debugger` adapter in splash; exercises `prompt.strategy: regex`
+  against SGR-decorated prompt bytes emitted by perl5db.
+homepage: https://perldoc.perl.org/perldebug
+license: Artistic-1.0-Perl OR GPL-1.0-or-later
+family: debugger
+aliases:
+  - perl-d
+  - perl-debugger
+
+process:
+  # perl5db.pl ships with every perl distribution — the adapter name
+  # (`perldb`) is not an executable on PATH, so the worker resolves
+  # a `perl` launcher from the candidate list below. Candidates are
+  # tried left-to-right; the first that resolves to an existing file
+  # wins. splash's worker launches under a clean registry environment
+  # block, so bare `perl` only works when perl.exe is on User/Machine
+  # PATH (Strawberry, ActivePerl, or a Linux/macOS box). Git for
+  # Windows deliberately keeps its bundled `usr\bin\perl.exe` OFF
+  # the PATH to avoid shadowing native Windows tools, so we list it
+  # explicitly as the final Windows fallback.
+  executable_candidates:
+    # PATH search — wins on boxes with Strawberry Perl / ActivePerl /
+    # Linux or macOS system perl exposed through PATH.
+    - perl
+    # Strawberry Perl default install layout.
+    - 'C:\Strawberry\perl\bin\perl.exe'
+    # ActivePerl 64-bit default.
+    - 'C:\Perl64\bin\perl.exe'
+    # ActivePerl 32-bit / older installs.
+    - 'C:\Perl\bin\perl.exe'
+    # Git for Windows bundled perl — last Windows fallback because
+    # it's not on PATH but is the most commonly present distribution
+    # on developer workstations.
+    - 'C:\Program Files\Git\usr\bin\perl.exe'
+    # Linux / BSD system perl.
+    - /usr/bin/perl
+    # macOS Homebrew / Linux user install.
+    - /usr/local/bin/perl
+  # `perl -d -e 0` = run the program `0;` under the debugger. perl5db.pl
+  # loads, prints its banner, stops at the first executable statement
+  # (`0`), and displays `  DB<1> `, then waits for a debugger command.
+  # No user script or tempfile is involved.
+  command_template: '"{shell_path}" -d -e 0'
+  inherit_environment: true
+  env:
+    # Disable readline editing inside the debugger. Without this, on a
+    # box with Term::ReadLine::Gnu or ::Perl installed, perl5db will
+    # rewrite the prompt line via cursor movement, which corrupts
+    # ConPTY's captured stream and breaks regex-based prompt detection.
+    # ReadLine=0 forces the plain stdin/stdout fallback path.
+    PERLDB_OPTS: "ReadLine=0 NonStop=0"
+  encoding: utf-8
+  # Perl on Windows reads stdin under ConPTY cooked mode, same as
+  # Python / Node / fsi — CR is treated as Enter.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  # perl5db on Windows prints its banner and first prompt within ~150ms.
+  # A short post-ready delay lets the banner bytes drain before the
+  # first test eval races the prompt.
+  delay_after_inject_ms: 300
+
+init:
+  # Perl debugger needs no integration script: it ships with a full
+  # interactive command dispatcher out of the box. This is the first
+  # adapter to exercise `init.strategy: none` — no script injection,
+  # no prompt hook, no launch-time patching of the interpreter.
+  strategy: none
+  hook_type: none
+  delivery: none
+
+prompt:
+  # perl5db prints the prompt as `\x1b[4m  DB<N> \x1b[24m\x1b[1m\x1b[0m`:
+  # two leading spaces, literal `DB<`, counter, `> `, wrapped in SGR
+  # underline/bold codes. RegexPromptDetector strips SGR sequences
+  # before running the regex (per fsi.yaml's documented contract), so
+  # we match against the clean visible text.
+  #
+  # Nested debugger contexts (e.g. when a breakpoint pauses inside a
+  # called sub, or when `o inhibit_exit` triggers a nested session)
+  # use `DB<<N>>` with two angle brackets, and deeper nesting levels
+  # add more brackets (`DB<<<N>>>` at depth 3, etc.). The `<+` / `>+`
+  # quantifiers match any nesting level so splash tracks prompt
+  # boundaries correctly through breakpoint pauses and resumes.
+  strategy: regex
+  primary: '^  DB<+\d+>+ $'
+
+output:
+  post_prompt_settle_ms: 100
+  strip_ansi: false
+  strip_input_echo: true
+  # No OSC C/B hook from perl5db, so walk the captured slice and strip
+  # the byte-for-byte echo of what we sent — same strategy as fsi /
+  # python / cmd.
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  # perl5db is strictly line-oriented at the command prompt. Multi-line
+  # Perl code would need `{ ... }` block continuation which is out of
+  # scope for v0.1 — splash users send single-line `p EXPR` style
+  # commands, which is how 99% of debugger interaction actually works.
+  multiline_detect: none
+  multiline_delivery: direct
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: "q"
+    grace_ms: 500
+    force_signal: kill
+
+modes:
+  - name: main
+    primary: '^  DB<\d+> $'
+    default: true
+  - name: paused
+    auto_enter: true
+    detect: '^  DB<<'
+    primary: '^  DB<<\d+>> $'
+    nested: true
+    advance_commands:
+      - { command: "s", effect: step_in }
+      - { command: "n", effect: step_over }
+      - { command: "r", effect: step_out }
+    exit_commands:
+      - { command: "c", effect: resume }
+
+commands:
+  debugger:
+    # --- Navigation ---
+    step_in:        "s"
+    step_over:      "n"
+    step_out:       "r"
+    continue:       "c"
+    run:            null            # perl -de 0 has no "run" — program is already loaded
+    # --- Inspection ---
+    #   `p` prints scalar context — arrays/hashes concatenate.
+    #   `x` dumps with Data::Dumper-style formatting (indices, nesting).
+    #   Always prefer `x` for structured data and `p` for scalars.
+    print:          "p {expr}"
+    dump:           "x {expr}"
+    backtrace:      "T"
+    source_list:    "l"
+    # `l subname` lists source of a named sub from a file; `l` alone
+    # lists around the current line. Use `l` after breakpoint to see
+    # context; use `l subname` when navigating to a function of interest.
+    locals:         "V"            # V [pkg [vars]] — list variables in package
+    where:          "."            # show current file:line
+    args:           "x @_"         # dump argument list (x over p to see structure)
+    # --- Breakpoints ---
+    # IMPORTANT: `b {target}` (function-name form) works reliably for
+    # subs defined inline in the debugger's eval context. For subs
+    # loaded from external files via `do 'file.pl'` or `require`,
+    # function-name breakpoints may silently fail because perl5db's
+    # internal address resolution doesn't always match the file-loaded
+    # code. In that case, use `b {line}` instead — line-number
+    # breakpoints are always reliable. Workflow:
+    #   1. `do 'path/to/file.pl'`     — load the code
+    #   2. `l subname`                 — find the line numbers
+    #   3. `b 8`                       — set breakpoint by line
+    breakpoint_set:       "b {target}"
+    breakpoint_set_line:  "b {line}"
+    breakpoint_list:      "L"
+    breakpoint_clear_all: "B *"
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: true
+  async_output: false
+  exit_code: "unreliable"
+  cwd_tracking: false
+  cwd_format: "none"
+  job_control: false
+  shell_integration: null
+  user_busy_detection: none
+
+probe:
+  # `p EXPR` prints EXPR via perl5db's print command. `p 1+1` prints `2`
+  # followed by a newline, then the next `  DB<2> ` prompt.
+  eval: "p 1+1"
+  expect: '^2$'
+
+tests:
+  - name: "print integer arithmetic"
+    eval: "p 21 * 2"
+    expect: '^42$'
+
+  - name: "state: package global persists across commands"
+    setup_sequence:
+      - eval: "$main::x = 100"
+    eval: "p $main::x + 1"
+    expect: '^101$'
+
+  - name: "string concatenation"
+    eval: 'p "hello" . "-world"'
+    expect: '^hello-world$'
+
+  - name: "built-in function call"
+    eval: "p length('splash')"
+    expect: '^6$'
+
+  # Debugger-specific: `o FOO?` is a perl5db meta-command that queries
+  # the value of debugger option FOO. It doesn't exist in plain perl —
+  # running `o NonStop?` outside the debugger is a syntax error. This
+  # test proves splash is really driving perl5db.pl, not just evaluating
+  # perl expressions at a REPL.
+  - name: "debugger meta command: option query"
+    eval: "o NonStop?"
+    expect: "NonStop = '0'"
+
+  # Real-debugging workflow #1: breakpoint registration.
+  # Define a sub inline, attach a breakpoint to it via `b`, then use
+  # `L` (list breakpoints) to verify perldb really registered it.
+  # `L` prints the source line carrying the breakpoint; we match the
+  # sub body substring to confirm the correct target was tagged.
+  - name: "breakpoint: set on sub, L lists the breakpoint body"
+    setup_sequence:
+      - eval: "sub double_it { my $n = shift; return $n * 2; }"
+      - eval: "b double_it"
+    eval: "L"
+    expect: "sub double_it"
+
+  # Real-debugging workflow #2: end-to-end breakpoint hit → continue →
+  # verify return value. The setup_sequence defines the sub, sets the
+  # breakpoint, and invokes it — at which point perldb pauses at the
+  # sub's entry with a nested `DB<<N>>` prompt (handled by the widened
+  # prompt regex above). The next step (`c`) resumes execution so the
+  # sub runs to completion and `$main::result` is assigned. The final
+  # eval inspects `$main::result` to prove the resumed code path
+  # actually returned 42.
+  #
+  # This is the first splash test that exercises:
+  #   - breakpoint setting on a runtime-defined sub
+  #   - the nested-context prompt (`DB<<N>>`)
+  #   - resume-from-pause (`c`)
+  #   - post-resume state inspection
+  # — i.e. the core debugger loop, not just REPL-style eval.
+  - name: "breakpoint: hit fires nested prompt, c resumes, return captured"
+    setup_sequence:
+      - eval: "sub double_it { my $n = shift; return $n * 2; }"
+      - eval: "b double_it"
+      - eval: "$main::result = double_it(21)"
+      - eval: "c"
+    eval: "p $main::result"
+    expect: '^42$'

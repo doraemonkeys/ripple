@@ -52,6 +52,8 @@
     <EmbeddedResource Include="adapters\fsi.yaml" />
     <EmbeddedResource Include="adapters\jshell.yaml" />
     <EmbeddedResource Include="adapters\groovy.yaml" />
+    <EmbeddedResource Include="adapters\perldb.yaml" />
+    <EmbeddedResource Include="adapters\jdb.yaml" />
   </ItemGroup>
 
 </Project>

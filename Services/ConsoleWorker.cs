@@ -180,15 +180,57 @@ public class ConsoleWorker
             ? $"Adapter matched: name={_adapter.Name} family={_adapter.Family} version={_adapter.Version}"
             : $"No adapter matched for shell family '{_shellFamily}' — using hardcoded fallback");
 
-        // process.executable override: for adapters whose REPL name does
-        // not match an executable on PATH (fsi → dotnet, jshell → java,
-        // etc.), the adapter declares which binary to launch. Re-resolve
-        // _shell against that name so {shell_path} expansion in
-        // BuildCommandLine produces the right launcher.
-        if (!string.IsNullOrEmpty(_adapter?.Process.Executable))
+        // process.executable{_candidates} override: for adapters whose
+        // REPL name does not match an executable on PATH (fsi → dotnet,
+        // jshell → java, perldb → perl, etc.), the adapter declares
+        // which binary to launch. Re-resolve _shell against that name
+        // so {shell_path} expansion in BuildCommandLine produces the
+        // right launcher.
+        //
+        // Two override forms exist:
+        //  - `executable_candidates: [list]` — walked left-to-right,
+        //    each entry env-var-expanded and PATH-resolved. First entry
+        //    that exists on disk wins. Use this when the binary lives
+        //    at multiple plausible install locations across
+        //    distributions (Perl / JDK / Python / etc.).
+        //  - `executable: <string>` — single override, kept for
+        //    backwards compatibility and for cases where there's
+        //    exactly one canonical launcher (`dotnet` for fsi).
+        // Candidates take precedence when present; the single-string
+        // form is the fallback. When neither resolves, the adapter
+        // name is left as-is and CreateProcess will report
+        // ERROR_FILE_NOT_FOUND with a hopefully-actionable message.
+        if (_adapter?.Process.ExecutableCandidates is { Count: > 0 } candidates)
         {
-            var resolved = ConsoleManager.ResolveShellPath(_adapter.Process.Executable);
-            Log($"Executable override: {_adapter.Process.Executable} → {resolved}");
+            string? pickedResolved = null;
+            string? pickedRaw = null;
+            foreach (var raw in candidates)
+            {
+                var expanded = Environment.ExpandEnvironmentVariables(raw);
+                var resolved = ConsoleManager.ResolveShellPath(expanded);
+                if (File.Exists(resolved))
+                {
+                    pickedRaw = raw;
+                    pickedResolved = resolved;
+                    break;
+                }
+                Log($"Executable candidate miss: '{raw}' (expanded='{expanded}', resolved='{resolved}')");
+            }
+            if (pickedResolved != null)
+            {
+                Log($"Executable candidate picked: '{pickedRaw}' → {pickedResolved}");
+                _shell = pickedResolved;
+            }
+            else
+            {
+                Log($"WARNING: all {candidates.Count} executable_candidates failed for adapter '{_adapter.Name}'; launch will likely fail");
+            }
+        }
+        else if (!string.IsNullOrEmpty(_adapter?.Process.Executable))
+        {
+            var expanded = Environment.ExpandEnvironmentVariables(_adapter.Process.Executable);
+            var resolved = ConsoleManager.ResolveShellPath(expanded);
+            Log($"Executable override: '{_adapter.Process.Executable}' → {resolved}");
             _shell = resolved;
         }
 

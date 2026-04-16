@@ -1,0 +1,189 @@
+schema: 1
+name: jdb
+version: 0.1.0
+description: >
+  Java Debugger (jdb) from the JDK, driven as a REPL debugger adapter.
+  Launches jdb in detached mode (no target VM attached). In this mode
+  jdb accepts meta commands (`version`, `help`, `connectors`, `stop`)
+  and defers any breakpoint assertions until a VM is later attached or
+  launched via `run <class>`. Second `family: debugger` adapter in
+  splash, validating that the regex-prompt + init-none pattern
+  generalizes from perl5db to a completely unrelated debugger runtime.
+homepage: https://docs.oracle.com/en/java/javase/21/docs/specs/man/jdb.html
+license: GPL-2.0-with-classpath-exception
+family: debugger
+aliases:
+  - java-debugger
+  - jdwp-cli
+
+process:
+  # JDK bin directories are rarely on the registry PATH unless the
+  # user opted in at install time (most JDK installers skip the PATH
+  # change to avoid clobbering multi-JDK setups). The candidate list
+  # below covers the common install locations across JDK distributions:
+  #   - PATH / JAVA_HOME (the environment-variable form every Java
+  #     developer tutorial tells people to set)
+  #   - Microsoft OpenJDK (default Visual Studio Java workload)
+  #   - Eclipse Temurin / Adoptium (the modern community default)
+  #   - Oracle / Azul Zulu / Amazon Corretto common layouts
+  #   - Linux / macOS system java paths
+  # Environment variables in candidates are expanded before resolution,
+  # so `%JAVA_HOME%\bin\jdb.exe` picks up whichever JDK the user has
+  # already configured at the OS level, even if the bin directory
+  # isn't on PATH.
+  executable_candidates:
+    # PATH search — wins if the JDK installer added bin to PATH.
+    - jdb
+    # JAVA_HOME is the canonical Java env var; covers every distribution.
+    - '%JAVA_HOME%\bin\jdb.exe'
+    - '%JAVA_HOME%/bin/jdb'
+    # Microsoft OpenJDK (ships with VS Java workload, Azure AKS, etc.).
+    - 'C:\Program Files\Microsoft\jdk-21.0.10.7-hotspot\bin\jdb.exe'
+    # Eclipse Temurin / Adoptium — version-less path last, specific
+    # majors first in case multiple are installed.
+    - 'C:\Program Files\Eclipse Adoptium\jdk-21\bin\jdb.exe'
+    - 'C:\Program Files\Eclipse Adoptium\jdk-17\bin\jdb.exe'
+    # Oracle JDK.
+    - 'C:\Program Files\Java\jdk-21\bin\jdb.exe'
+    - 'C:\Program Files\Java\jdk-17\bin\jdb.exe'
+    # Linux / macOS.
+    - /usr/bin/jdb
+    - /usr/local/bin/jdb
+  # Bare launch with no target class. jdb prints
+  #   Initializing jdb ...
+  #   >
+  # and waits. Commands that need a running VM (classes, threads,
+  # print <expr>, locals) will respond with "not valid until the VM
+  # is started with the 'run' command" — that's fine for meta-command
+  # tests. A follow-up variant adapter can pass `-classpath <dir>
+  # <ClassName>` here to debug a real target.
+  command_template: '"{shell_path}"'
+  inherit_environment: true
+  encoding: utf-8
+  # jdb on Windows reads stdin via java.io.Console which treats \r as
+  # Enter under ConPTY cooked mode — same as Python, Node, fsi, and
+  # perldb.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  # jdb cold start on this box = ~800ms (JVM startup + class loading).
+  # A short post-ready settle window lets the banner drain before the
+  # test runner sends its first command.
+  delay_after_inject_ms: 500
+
+init:
+  # jdb ships with a full interactive command interpreter out of the
+  # box — no prompt hook, no script injection, no OSC 633 emission.
+  # Same `none` strategy as perldb; second adapter to exercise it.
+  strategy: none
+  hook_type: none
+  delivery: none
+
+prompt:
+  # jdb's visible prompt is `> ` at line start, same shape as fsi.
+  # Strict `^> $` works cleanly after the 2026-04-16 OSC-strip fix
+  # to RegexPromptDetector. Before that fix, ConPTY's window-title
+  # OSC sequence (`ESC ] 0 ; <path-to-jdb.exe> BEL`) — emitted when
+  # the worker launched the child and the terminal title-bar picked
+  # up the executable path — survived the detector's CSI-only
+  # stripper and sat directly in front of the `> ` prompt bytes,
+  # preventing `^` from anchoring. The fix extends the stripper to
+  # consume OSC (ESC `]`) sequences too. No adapter workaround
+  # remains necessary; the strict regex is the correct expression.
+  strategy: regex
+  primary: '^> $'
+
+output:
+  post_prompt_settle_ms: 100
+  strip_ansi: false
+  strip_input_echo: true
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  multiline_detect: none
+  multiline_delivery: direct
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    # `quit` is the canonical exit command; `exit` is an alias.
+    command: "quit"
+    grace_ms: 1000
+    force_signal: kill
+
+commands:
+  debugger:
+    # --- Navigation ---
+    step_in:        "step"
+    step_over:      "next"
+    step_out:       "step up"
+    continue:       "cont"
+    run:            "run"
+    # --- Inspection ---
+    print:          "print {expr}"
+    dump:           "dump {expr}"
+    backtrace:      "where"
+    source_list:    "list"
+    locals:         "locals"
+    where:          "where"
+    args:           null            # jdb has no dedicated args command; use `locals` or `print <param>`
+    # --- Breakpoints ---
+    breakpoint_set:       "stop in {target}"
+    breakpoint_set_line:  "stop at {target}:{line}"
+    breakpoint_list:      "clear"         # `clear` with no args lists breakpoints
+    breakpoint_clear_all: null            # jdb has no clear-all; must clear individually
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: true
+  async_output: false
+  exit_code: "unreliable"
+  cwd_tracking: false
+  cwd_format: "none"
+  job_control: false
+  shell_integration: null
+  user_busy_detection: none
+
+probe:
+  # `version` is the simplest command that works in jdb's detached
+  # mode (no VM attached). It prints one line of the form
+  #   This is jdb version 21.0 (Java SE version 21.0.10)
+  # regardless of whether a VM is running, which makes it an ideal
+  # smoke test for the adapter's launch + prompt-detection pipeline.
+  eval: "version"
+  expect: 'Java SE version'
+
+tests:
+  - name: "jdb version banner includes JDK major version"
+    eval: "version"
+    expect: 'jdb version 21'
+
+  - name: "help lists the stop command"
+    eval: "help"
+    # jdb's help output prints `stop [go|thread] ...` on one line and
+    # the description `-- set a breakpoint` on a separate indented
+    # continuation line, so we match the description substring
+    # directly rather than trying to span both lines with .* across
+    # a newline.
+    expect: 'set a breakpoint'
+
+  - name: "detached mode: classes command requires a running VM"
+    eval: "classes"
+    expect: "not valid until the VM is started"
+
+  - name: "deferred breakpoint registration"
+    eval: "stop in Hello.main"
+    expect: "Deferring breakpoint Hello.main"

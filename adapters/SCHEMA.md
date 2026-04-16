@@ -62,6 +62,12 @@ stamped on a shipped splash release.
 ```yaml
 process:
   command_template: '"{shell_path}" -NoExit -Command "{init_invocation}"'
+  executable: dotnet
+  executable_candidates:
+    - jdb
+    - '%JAVA_HOME%\bin\jdb.exe'
+    - 'C:\Program Files\Eclipse Adoptium\jdk-21\bin\jdb.exe'
+    - /usr/bin/jdb
   inherit_environment: false
   env:
     POWERSHELL_TELEMETRY_OPTOUT: "1"
@@ -72,6 +78,24 @@ process:
 - **`command_template`** — string template with `{placeholders}`. The runtime
   substitutes `{shell_path}` (resolved via PATH), `{init_invocation}` (expanded
   from `init`), `{tempfile_path}`, `{pid}`, `{guid}`, `{temp_dir}` as needed.
+- **`executable`** — optional single-string override for the launcher binary
+  when the adapter name doesn't match a PATH-discoverable executable. Used by
+  `fsi` (→ `dotnet`), `jshell` (→ `java`), etc. The string is env-expanded and
+  PATH-resolved before being substituted into `{shell_path}`. When present
+  alongside `executable_candidates`, candidates win.
+- **`executable_candidates`** — ordered list of launcher candidates tried
+  left-to-right; the first entry that resolves to an existing file on disk
+  wins. Each entry goes through `Environment.ExpandEnvironmentVariables` so
+  Windows-style `%VAR%` references resolve against the worker's environment
+  before path search. Bare names are resolved via registry PATH + PATHEXT;
+  rooted paths are used as-is after env expansion. Solves the "single absolute
+  path doesn't port across distributions" problem: adapters for interpreters
+  with multiple well-known install locations (Perl's Strawberry / ActivePerl /
+  Git-bundled, Java's Temurin / Corretto / Zulu / Microsoft OpenJDK, Python's
+  python.org / Windows Store / Anaconda) declare every plausible location
+  once and the worker picks whichever is present on the host. Falls back to
+  `executable`, then to the adapter name, when the list is null, empty, or
+  fully unresolvable.
 - **`inherit_environment`** — if `false`, the runtime calls
   `CreateEnvironmentBlock(bInherit=false)` (Windows) / `env -i` (Unix) so the
   child sees only the OS-default environment. pwsh uses this to avoid
@@ -365,6 +389,10 @@ modes:
     primary: '^pry\(\d+\)> $'
     nested: false
     level_capture: null
+    advance_commands:
+      - { command: "next", effect: step_over }
+      - { command: "step", effect: step_in }
+      - { command: "finish", effect: step_out }
     exit_commands:
       - { command: "continue", effect: resume }
       - { command: "respawn()", effect: return_to_toplevel }
@@ -376,6 +404,14 @@ modes:
   keystroke. Runtime must re-check mode on every response.
 - **`nested: true`** — this mode can stack on itself (SBCL debugger `0] 1] 2]`).
   Requires `level_capture` in the prompt regex.
+- **`advance_commands`** — commands that change execution position *within*
+  this mode without leaving it. After a `step_in` or `step_over`, the
+  debugger is still paused — just at a different source location. AI agents
+  use `advance_commands` to distinguish "I stepped one line but I'm still
+  paused" from "I resumed and left the breakpoint" (`exit_commands`).
+  - `step_in` — step into the next function call
+  - `step_over` — execute one source line, stepping over calls
+  - `step_out` — run until the current function returns to its caller
 - **`exit_commands.effect`** — semantic label for what happens when the exit
   command is run:
   - `return_to_toplevel` — unwind all the way to main mode
@@ -395,10 +431,46 @@ commands:
   builtin:
     - { name: type, syntax: ":type {expr}", description: Show type of expression }
     - { name: load, syntax: ":load {file}", description: Load a source file }
+  debugger:
+    step_in:        "s"
+    step_over:      "n"
+    step_out:       "r"
+    continue:       "c"
+    run:            null
+    print:          "p {expr}"
+    dump:           "x {expr}"
+    backtrace:      "T"
+    source_list:    "l"
+    locals:         "V"
+    where:          "."
+    args:           "p @_"
+    breakpoint_set:       "b {target}"
+    breakpoint_set_line:  "b {line}"
+    breakpoint_list:      "L"
+    breakpoint_clear_all: "B *"
 ```
 
 This is a hint-only section. The runtime uses it to populate LLM tool
 descriptions; it doesn't enforce or parse the commands itself.
+
+**`debugger`** — structured command vocabulary for `family: debugger`
+adapters. Each field is a command template string with `{expr}`,
+`{target}`, `{line}`, `{file}` placeholders, or `null` when the
+operation is not supported. AI agents read this section to discover
+"how do I step / print / set a breakpoint in this debugger" without
+parsing help text. The vocabulary covers three areas:
+
+| Category | Fields |
+|---|---|
+| **Navigation** | `step_in`, `step_over`, `step_out`, `continue`, `run` |
+| **Inspection** | `print`, `dump`, `backtrace`, `source_list`, `locals`, `where`, `args` |
+| **Breakpoints** | `breakpoint_set`, `breakpoint_set_line`, `breakpoint_list`, `breakpoint_clear_all` |
+
+Templates use named placeholders: `{expr}` for expressions to evaluate,
+`{target}` for breakpoint targets (function name, `Class.method`),
+`{line}` for line numbers, `{file}` for file paths. Multiple
+placeholders in one template are allowed (e.g.
+`stop at {target}:{line}`).
 
 ---
 

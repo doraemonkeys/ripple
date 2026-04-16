@@ -59,8 +59,35 @@ public class ProcessSpec
     /// worker re-resolves <c>{shell_path}</c> against this override
     /// before expanding <see cref="CommandTemplate"/>. When null, the
     /// default behaviour applies: the shell name is resolved verbatim.
+    ///
+    /// Prefer <see cref="ExecutableCandidates"/> when the binary lives
+    /// at multiple well-known install locations across distributions
+    /// (Perl, JDK, Python, etc.).
     /// </summary>
     public string? Executable { get; set; }
+
+    /// <summary>
+    /// Ordered list of launcher candidates tried left-to-right; the
+    /// first one that resolves to an existing file wins. Each entry
+    /// goes through <c>Environment.ExpandEnvironmentVariables</c> so
+    /// Windows-style <c>%VAR%</c> references (e.g. <c>%JAVA_HOME%\bin\jdb.exe</c>)
+    /// resolve against the process environment before path search.
+    /// Bare names (like <c>perl</c>) are resolved via
+    /// <see cref="ConsoleManager.ResolveShellPath"/>, which searches
+    /// the registry PATH + PATHEXT on Windows. Rooted paths are used
+    /// as-is after env-var expansion.
+    ///
+    /// This field solves the "single absolute path doesn't port across
+    /// distributions" problem: adapters for interpreters with multiple
+    /// common install locations (Strawberry Perl, ActivePerl, Git-
+    /// bundled perl, system perl; Temurin / Corretto / Zulu / OpenJDK
+    /// for Java; python.org / Windows Store / Anaconda for Python) can
+    /// declare every plausible location once and let the worker pick
+    /// whichever is installed on the host. Falls back to
+    /// <see cref="Executable"/> and then to the adapter name when the
+    /// list is null, empty, or fully unresolvable.
+    /// </summary>
+    public List<string>? ExecutableCandidates { get; set; }
 }
 
 public class ReadySpec
@@ -295,6 +322,16 @@ public class ModeSpec
     public string? Detect { get; set; }
     public bool Nested { get; set; }
     public int? LevelCapture { get; set; }
+    /// <summary>
+    /// Commands that advance execution position within this mode
+    /// (step-in, step-over, step-out). Unlike exit_commands which
+    /// leave the mode entirely (continue/resume), advance commands
+    /// keep the debugger in the same paused mode but at a different
+    /// source location. AI agents use this to distinguish "I stepped
+    /// one line but I'm still paused" from "I resumed and left the
+    /// breakpoint".
+    /// </summary>
+    public List<AdvanceCommandSpec>? AdvanceCommands { get; set; }
     public List<ExitCommandSpec>? ExitCommands { get; set; }
     public string? ExitDetect { get; set; }
     public List<GroupCapture>? GroupCaptures { get; set; }
@@ -306,12 +343,97 @@ public class ExitCommandSpec
     public string Effect { get; set; } = "";          // return_to_toplevel | invoke_restart | resume | unwind_one_level
 }
 
+/// <summary>
+/// A command that advances execution position within a paused mode
+/// (debugger step operations). Same shape as ExitCommandSpec but with
+/// a different effect vocabulary: step_in, step_over, step_out.
+/// </summary>
+public class AdvanceCommandSpec
+{
+    public string Command { get; set; } = "";
+    public string Effect { get; set; } = "";          // step_in | step_over | step_out
+}
+
 public class CommandsSpec
 {
     public string Prefix { get; set; } = "";
     public List<string>? Scope { get; set; }
     public string? Discovery { get; set; }
     public List<BuiltinCommand>? Builtin { get; set; }
+
+    /// <summary>
+    /// Structured command vocabulary for <c>family: debugger</c> adapters.
+    /// Each field is a command template string with <c>{expr}</c>,
+    /// <c>{target}</c>, <c>{line}</c>, <c>{file}</c> placeholders, or
+    /// null when the operation is not supported by this debugger. AI
+    /// agents read this section to discover "how do I step / print /
+    /// set a breakpoint in this particular debugger" without parsing
+    /// help text or guessing from the adapter name.
+    /// </summary>
+    public DebuggerCommandsSpec? Debugger { get; set; }
+}
+
+/// <summary>
+/// Command templates for debugger operations. Every field is a string
+/// template or null. Templates use <c>{expr}</c> for expressions,
+/// <c>{target}</c> for breakpoint targets (function name, class.method),
+/// <c>{line}</c> for line numbers, <c>{file}</c> for file paths.
+/// </summary>
+public class DebuggerCommandsSpec
+{
+    // --- Navigation (change execution position) ---
+
+    /// <summary>Step into the next function call.</summary>
+    public string? StepIn { get; set; }
+
+    /// <summary>Execute one source line, stepping over calls.</summary>
+    public string? StepOver { get; set; }
+
+    /// <summary>Run until the current function returns to its caller.</summary>
+    public string? StepOut { get; set; }
+
+    /// <summary>Resume execution until the next breakpoint (or program end).</summary>
+    public string? Continue { get; set; }
+
+    /// <summary>Start (or restart) the target program.</summary>
+    public string? Run { get; set; }
+
+    // --- Inspection (read state without side effects) ---
+
+    /// <summary>Evaluate and print an expression. Template: <c>p {expr}</c>.</summary>
+    public string? Print { get; set; }
+
+    /// <summary>Structured dump (arrays, objects). Template: <c>x {expr}</c>.</summary>
+    public string? Dump { get; set; }
+
+    /// <summary>Print the call stack / backtrace.</summary>
+    public string? Backtrace { get; set; }
+
+    /// <summary>List source lines around the current position.</summary>
+    public string? SourceList { get; set; }
+
+    /// <summary>Print all local variables in the current frame.</summary>
+    public string? Locals { get; set; }
+
+    /// <summary>Show the current file, line, and function.</summary>
+    public string? Where { get; set; }
+
+    /// <summary>Print function arguments (e.g. <c>p @_</c> in perl, <c>info args</c> in gdb).</summary>
+    public string? Args { get; set; }
+
+    // --- Breakpoints ---
+
+    /// <summary>Set a breakpoint on a target (function/method name). Template: <c>b {target}</c>.</summary>
+    public string? BreakpointSet { get; set; }
+
+    /// <summary>Set a breakpoint at a specific source line. Template: <c>b {line}</c>.</summary>
+    public string? BreakpointSetLine { get; set; }
+
+    /// <summary>List all currently set breakpoints.</summary>
+    public string? BreakpointList { get; set; }
+
+    /// <summary>Delete all breakpoints at once.</summary>
+    public string? BreakpointClearAll { get; set; }
 }
 
 public class BuiltinCommand

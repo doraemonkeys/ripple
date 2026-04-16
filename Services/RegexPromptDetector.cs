@@ -152,6 +152,44 @@ public sealed class RegexPromptDetector
         while (i < input.Length)
         {
             var c = input[i];
+            // OSC (Operating System Command): `ESC ]` ... `BEL` or `ESC \`.
+            // Window-title setters (`ESC ] 0 ; <title> BEL`) are the common
+            // case — emitted by ConPTY after launching a child process to
+            // reflect the child's executable path in the terminal title
+            // bar. These sequences sit in the PTY output stream right next
+            // to a prompt and, because they're NOT `ESC [` (CSI), the CSI
+            // loop below would leave them intact, pushing real content off
+            // column 1 and breaking `^` anchoring for the adapter's prompt
+            // regex. Strip them entirely — splash's visible-console title
+            // is managed separately via ConsoleWorker's _desiredTitle path,
+            // so dropping OSC from the regex detector's view doesn't lose
+            // any user-facing behaviour.
+            if (c == '\x1b' && i + 1 < input.Length && input[i + 1] == ']')
+            {
+                int j = i + 2;
+                while (j < input.Length)
+                {
+                    // BEL (0x07) terminator — the xterm-style form.
+                    if (input[j] == '\x07') { j++; break; }
+                    // ST (ESC \) terminator — the strict ECMA-48 form.
+                    if (input[j] == '\x1b' && j + 1 < input.Length && input[j + 1] == '\\')
+                    {
+                        j += 2;
+                        break;
+                    }
+                    j++;
+                }
+                // Completed OR unterminated — in either case we advance
+                // past whatever we consumed. Unterminated OSC at end of
+                // chunk is rare enough (titles are short and usually
+                // flushed atomically) that we don't need the CSI path's
+                // partial-carry-over logic; if it ever bites, the
+                // subsequent chunk will bring the terminator and the
+                // next scan will re-strip cleanly because the detector's
+                // outer buffer retains unconsumed tail text.
+                i = j;
+                continue;
+            }
             if (c == '\x1b' && i + 1 < input.Length && input[i + 1] == '[')
             {
                 // Walk to the CSI terminator (any letter A-Z / a-z).

@@ -216,6 +216,48 @@ public static class RegexPromptDetectorTests
                 $"CSI: empty CUF param defaults to 1 column (got {offsets.Count})");
         }
 
+        // OSC title set (`ESC ] 0 ; <title> BEL`) interleaved with a prompt.
+        // This is the jdb adapter's exact failure mode pre-fix: ConPTY
+        // emits `\x1b]0;<path-to-jdb.exe>\x07` right after the banner, and
+        // the previous version of the stripper (CSI-only) left it intact,
+        // pushing the subsequent `> ` prompt off column 1 and preventing
+        // `^> $` from matching. The OSC branch in StripCsiWithMap now
+        // drops these sequences entirely so the prompt regex anchors
+        // correctly regardless of window-title noise from the host.
+        {
+            var d = new RegexPromptDetector(@"^> $");
+            var chunk = "\x1b]0;C:\\Program Files\\Microsoft\\jdk\\bin\\jdb.exe\x07> ";
+            var offsets = d.Scan(chunk);
+            Assert(offsets.Count == 1,
+                $"OSC: title-setter (`ESC ] 0 ; ... BEL`) stripped, `^> $` matches (got {offsets.Count})");
+        }
+
+        // OSC with ST (`ESC \`) terminator — the strict ECMA-48 form.
+        // Less common than BEL in practice but a valid terminator the
+        // stripper must also handle to avoid leaving OSC payloads in the
+        // matching text.
+        {
+            var d = new RegexPromptDetector(@"^> $");
+            var chunk = "\x1b]0;title\x1b\\> ";
+            var offsets = d.Scan(chunk);
+            Assert(offsets.Count == 1,
+                $"OSC: ST terminator (`ESC \\\\`) form also stripped (got {offsets.Count})");
+        }
+
+        // OSC followed by a CSI cursor-show, then prompt — real jdb chunk
+        // layout as captured during root-cause investigation (2026-04-16).
+        // The stripper must handle both escape families in sequence; if
+        // the OSC branch ever gets the loop state wrong, the trailing CSI
+        // pass is where it would surface as a leaked `\x1b[?25h` in the
+        // stripped text.
+        {
+            var d = new RegexPromptDetector(@"^> $");
+            var chunk = "\x1b]0;jdb.exe\x07\x1b[?25h> ";
+            var offsets = d.Scan(chunk);
+            Assert(offsets.Count == 1,
+                $"OSC + CSI sequence: both stripped cleanly (got {offsets.Count})");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
