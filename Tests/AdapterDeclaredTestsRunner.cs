@@ -94,7 +94,7 @@ public static class AdapterDeclaredTestsRunner
         try
         {
             var launcher = new ProcessLauncher();
-            workerPid = launcher.LaunchConsoleWorker(proxyPid, agentId, shell, cwd);
+            workerPid = launcher.LaunchConsoleWorker(proxyPid, agentId, shell, cwd, noUserInput: true);
         }
         catch (Exception ex)
         {
@@ -204,7 +204,7 @@ public static class AdapterDeclaredTestsRunner
         try
         {
             var launcher = new ProcessLauncher();
-            workerPid = launcher.LaunchConsoleWorker(proxyPid, agentId, shell, cwd);
+            workerPid = launcher.LaunchConsoleWorker(proxyPid, agentId, shell, cwd, noUserInput: true);
         }
         catch (Exception ex)
         {

@@ -2684,8 +2684,10 @@ public class ConsoleWorker
                 case "--cwd" when i + 1 < args.Length: cwd = args[++i]; break;
                 case "--banner" when i + 1 < args.Length: banner = args[++i]; break;
                 case "--reason" when i + 1 < args.Length: reason = args[++i]; break;
+                case "--no-user-input": break; // parsed below
             }
         }
+        bool noUserInput = args.Contains("--no-user-input");
 
         if (proxyPid == null || agentId == null || shell == null)
         {
@@ -2701,7 +2703,10 @@ public class ConsoleWorker
 
         Log($"PID={ownPid} Pipe={pipeName} Shell={shell} Cwd={cwd}");
 
-        var worker = new ConsoleWorker(pipeName, int.Parse(proxyPid), shell, cwd, banner, reason);
+        var worker = new ConsoleWorker(pipeName, int.Parse(proxyPid), shell, cwd, banner, reason)
+        {
+            _holdUserInput = noUserInput  // --no-user-input: permanently hold (suppress) input forwarding
+        };
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 

@@ -75,7 +75,7 @@ public class ProcessLauncher
     /// The worker constructs its pipe name as SP.{proxyPid}.{agentId}.{ownPid},
     /// matching the name the proxy constructs from the returned PID (same as PowerShell.MCP pattern).
     /// </summary>
-    public int LaunchConsoleWorker(int proxyPid, string agentId, string shell, string? workingDirectory = null, string? banner = null, string? reason = null)
+    public int LaunchConsoleWorker(int proxyPid, string agentId, string shell, string? workingDirectory = null, string? banner = null, string? reason = null, bool noUserInput = false)
     {
         var exePath = Process.GetCurrentProcess().MainModule?.FileName
             ?? throw new InvalidOperationException("Cannot determine splash executable path");
@@ -87,6 +87,8 @@ public class ProcessLauncher
             args += $" --banner \"{banner.Replace("\"", "\\\"")}\"";
         if (!string.IsNullOrEmpty(reason))
             args += $" --reason \"{reason.Replace("\"", "\\\"")}\"";
+        if (noUserInput)
+            args += " --no-user-input";
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
