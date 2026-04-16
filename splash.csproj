@@ -57,6 +57,7 @@
     <EmbeddedResource Include="adapters\pdb.yaml" />
     <EmbeddedResource Include="adapters\sqlite3.yaml" />
     <EmbeddedResource Include="adapters\lua.yaml" />
+    <EmbeddedResource Include="adapters\deno.yaml" />
   </ItemGroup>
 
 </Project>

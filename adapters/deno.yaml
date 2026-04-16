@@ -1,0 +1,135 @@
+schema: 1
+name: deno
+version: 0.1.0
+description: >
+  Deno's built-in REPL for JavaScript / TypeScript evaluation. Deno is
+  a modern runtime alternative to Node — permissions-first security
+  model, native TypeScript execution, built-in standard library, and
+  single-exe distribution. `deno repl --quiet` launches an interactive
+  evaluator with a `> ` prompt and colorized output.
+
+  Distinct from the node adapter: Deno evaluates TypeScript directly
+  (`const x: number = 42` just works, no ts-node or tsconfig wiring),
+  supports top-level await natively, and imports from HTTPS URLs
+  (`import { assert } from "https://deno.land/std/assert/mod.ts"`).
+  Use this adapter when the target code is TypeScript, uses modern
+  ES modules, or needs Deno's Web Platform APIs (fetch, Temporal,
+  WebSocket, etc.).
+homepage: https://deno.land/
+license: MIT
+family: repl
+aliases:
+  - denoland
+
+process:
+  executable_candidates:
+    - deno
+    # winget DenoLand.Deno user-scope install.
+    - '%LOCALAPPDATA%\Microsoft\WinGet\Packages\DenoLand.Deno_Microsoft.Winget.Source_8wekyb3d8bbwe\deno.exe'
+    # Manual single-exe installs (common pattern for Deno).
+    - '%USERPROFILE%\.deno\bin\deno.exe'
+    - 'C:\Program Files\deno\deno.exe'
+    # Linux / macOS.
+    - /usr/bin/deno
+    - /usr/local/bin/deno
+    - /opt/homebrew/bin/deno
+    - '%HOME%/.deno/bin/deno'
+  # `--quiet` skips the banner / version line at startup so the first
+  # prompt appears immediately. No `--eval` preamble — Deno's REPL
+  # runs in a clean global scope by default.
+  command_template: '"{shell_path}" repl --quiet'
+  inherit_environment: true
+  env:
+    # Disable colored output at the adapter level so the regex prompt
+    # detector doesn't have to deal with SGR codes inside the `> ` or
+    # result-prefix text.
+    NO_COLOR: "1"
+  encoding: utf-8
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  # Deno cold start = ~500ms on this box. Short settle after the first
+  # `> ` appears.
+  delay_after_inject_ms: 200
+
+init:
+  strategy: none
+  hook_type: none
+  delivery: none
+
+prompt:
+  # Deno's REPL prompt is `> ` at line start, same shape as fsi and
+  # jdb. The OSC-strip fix in RegexPromptDetector handles ConPTY's
+  # window-title setter that would otherwise push the prompt off
+  # column 1.
+  strategy: regex
+  primary: '^> $'
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  strip_input_echo: true
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  multiline_detect: none
+  multiline_delivery: direct
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    # `close()` is Deno's documented REPL exit. Also accepts Ctrl+D.
+    command: "close()"
+    grace_ms: 500
+    force_signal: kill
+
+capabilities:
+  stateful: true      # const/let bindings persist across prompts
+  interrupt: true
+  meta_commands: false
+  async_output: false
+  exit_code: "unreliable"
+  cwd_tracking: false
+  cwd_format: "none"
+  job_control: false
+  shell_integration: null
+  user_busy_detection: none
+
+probe:
+  eval: "1 + 1"
+  expect: '^2$'
+
+tests:
+  - name: "integer arithmetic"
+    eval: "21 * 2"
+    expect: '^42$'
+
+  - name: "template literal"
+    eval: '`hello, ${"deno"}`'
+    expect: '"hello, deno"'
+
+  - name: "state: const persists across commands"
+    setup_sequence:
+      - eval: "const splashTest = 100"
+    eval: "splashTest + 1"
+    expect: '^101$'
+
+  - name: "top-level await resolves"
+    eval: "await Promise.resolve(99)"
+    expect: '^99$'
+
+  - name: "TypeScript type annotation evaluates cleanly"
+    eval: "const x: number = 42; x"
+    expect: '^42$'
