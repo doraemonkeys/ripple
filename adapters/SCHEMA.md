@@ -167,10 +167,6 @@ init:
       Write-Host '{banner}' -ForegroundColor Green
     reason_template: |
       Write-Host 'Reason: {reason}' -ForegroundColor DarkYellow
-  inject:                           # delivery: pty_inject
-    method: source_file
-    windows: { ... }
-    unix: { ... }
   rc_file:                          # delivery: rc_file
     dir_env_var: ZDOTDIR
     file_name: .zshrc

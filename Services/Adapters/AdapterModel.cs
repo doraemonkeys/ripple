@@ -120,7 +120,6 @@ public class InitSpec
 
     public TempfileSpec? Tempfile { get; set; }
     public BannerInjectionSpec? BannerInjection { get; set; }
-    public InjectSpec? Inject { get; set; }
     public RcFileSpec? RcFile { get; set; }
     public MarkerSpec? Marker { get; set; }
 }
@@ -170,28 +169,6 @@ public class BannerInjectionSpec
     public string Mode { get; set; } = "none";        // prepend_to_tempfile | write_before_pty | none
     public string? BannerTemplate { get; set; }
     public string? ReasonTemplate { get; set; }
-}
-
-public class InjectSpec
-{
-    public string Method { get; set; } = "";          // source_file | heredoc_eval
-    public InjectWindowsSpec? Windows { get; set; }
-    public InjectUnixSpec? Unix { get; set; }
-}
-
-public class InjectWindowsSpec
-{
-    public string? TempfilePrefix { get; set; }
-    public string? TempfileExtension { get; set; }
-    public string? WslPathTemplate { get; set; }
-    public string? MsysPathTemplate { get; set; }
-    public string? SourceCommandTemplate { get; set; }
-}
-
-public class InjectUnixSpec
-{
-    public string? TempfilePathTemplate { get; set; }
-    public string? SourceCommandTemplate { get; set; }
 }
 
 public class MarkerSpec

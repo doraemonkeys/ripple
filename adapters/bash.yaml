@@ -52,21 +52,6 @@ init:
   strategy: shell_integration
   hook_type: ps0
   delivery: pty_inject
-  inject:
-    method: source_file
-    windows:
-      tempfile_prefix: .splash-integration-
-      tempfile_extension: .sh
-      wsl_path_template: "/mnt/{drive_lower}{path_unix}"
-      msys_path_template: "/{drive_lower}{path_unix}"
-      source_command_template: "source '{unix_path}'; rm -f '{unix_path}'\n"
-    unix:
-      tempfile_path_template: "/tmp/.splash-integration-{pid}.sh"
-      source_command_template: |
-        cat > {tempfile_path} << 'SPLASH_EOF'
-        {script_body}
-        SPLASH_EOF
-        source {tempfile_path}; rm -f {tempfile_path}
   script_resource: integration.bash
 
 prompt:
