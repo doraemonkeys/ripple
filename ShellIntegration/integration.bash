@@ -16,6 +16,8 @@ __sp_osc() {
     printf '\e]633;%s\a' "$1"
 }
 
+__sp_emit_c_pending=0
+
 # Precmd: runs before each prompt via PROMPT_COMMAND. Emits OSC 633 D
 # (CommandFinished with exit code), P (cwd), A (PromptStart) so the
 # proxy tracker can close out the command just resolved. OSC D fires
@@ -32,31 +34,44 @@ __sp_precmd() {
     if [[ -n "$__sp_original_prompt_command" ]]; then
         eval "$__sp_original_prompt_command"
     fi
+
+    # Arm OSC C for the next user command. The DEBUG trap below fires it
+    # right before bash runs the first simple command of that submission,
+    # which is exactly the boundary the proxy tracker treats as "real
+    # command output starts here".
+    __sp_emit_c_pending=1
 }
 
-# PS0 is expanded and printed by bash AFTER reading the full command
-# line and BEFORE it starts executing any part of it — even for
-# subshells, pipelines, compound commands, or multi-statement lines.
-# That's exactly when we want OSC 633 C to fire: once per submission,
-# in the parent shell, so the proxy tracker's _commandStart marks the
-# boundary between input echo and real command output.
+# DEBUG trap: fires before every top-level simple command bash is about
+# to execute. Emit OSC 633 C exactly once per armed prompt cycle — the
+# BASH_COMMAND guard skips the bash-triggered call to __sp_precmd
+# itself, which would otherwise inject a spurious OSC C between the
+# previous command's output and the next prompt redraw.
 #
-# Using PS0 replaces the old DEBUG-trap / preexec approach, which had
-# two subtle failure modes:
+# Why DEBUG trap instead of PS0:
+#   PS0 is cleaner (single expansion-time hook, no recursion risk) but
+#   was only added in bash 4.4. macOS ships /bin/bash at 3.2 (last GPLv2
+#   release Apple is willing to bundle), where PS0 is silently ignored
+#   — producing a splash worker that emits OSC D/P/A but never OSC C,
+#   which leaves the tracker's resolve-on-PromptStart gate permanently
+#   unmet and every AI command hitting the full execute timeout. DEBUG
+#   works back to bash 2.x so this path covers every bash splash can
+#   plausibly run against.
 #
-#   1. DEBUG didn't fire for compound commands in the parent (only for
-#      simple commands inside subshells, and only with `set -T`), so
-#      `(echo foo)` left the parent's state un-flipped and resolve
-#      never fired.
-#   2. Even with `set -T`, inner `__sp_osc` calls inside PROMPT_COMMAND
-#      themselves fired DEBUG and caused spurious OSC C emissions mid-
-#      precmd, scrambling the output slice.
-#
-# PS0 is a single expansion-time hook with no recursion risk and no
-# subshell visibility issues.
-PS0=$'\e]633;C\a'
+# `set -T` (functrace) is intentionally NOT enabled: we want DEBUG to
+# fire for top-level user commands only. Without functrace, inner
+# commands inside __sp_precmd / __sp_osc don't fire DEBUG, so we get
+# the filter behaviour "for free" instead of needing to enumerate
+# every helper name in the BASH_COMMAND guard.
+__sp_debug() {
+    (( __sp_emit_c_pending )) || return
+    [[ "$BASH_COMMAND" == "__sp_precmd" ]] && return
+    __sp_emit_c_pending=0
+    __sp_osc "C"
+}
 
 PROMPT_COMMAND="__sp_precmd"
+trap __sp_debug DEBUG
 
 # Initial marker — emitted once at integration load so the proxy tracker
 # can distinguish "shell still starting up" from "shell ready for the
