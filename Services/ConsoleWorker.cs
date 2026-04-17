@@ -308,7 +308,17 @@ public class ConsoleWorker
         // "pwsh family = clean env, everyone else = inherit" rule.
         bool inheritEnv = _adapter?.Process.InheritEnvironment
             ?? !_isPwshFamily;
-        int cols = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
+        // PTY cols are floored at 200 even when the worker's visible ConHost
+        // is narrower. Shells decide where to emit soft-wrap \n at the
+        // declared PTY width; narrow terminals have been observed to split
+        // words mid-grapheme (e.g. "coverage" → "covera\nge") when the
+        // shell wraps at 80, which corrupts the AI-facing text slice.
+        // ConHost re-wraps visually at its actual window width on display,
+        // so the human experience is unchanged — but the captured bytes
+        // stay as full 200-col logical lines for AI consumption. Callers
+        // that genuinely need native-width rendering (TUIs like vim/less)
+        // are out of scope for the AI command path.
+        int cols = Math.Max(Console.WindowWidth > 0 ? Console.WindowWidth : 120, 200);
         int rows = Console.WindowHeight > 0 ? Console.WindowHeight : 30;
         var envOverrides = _adapter?.Process.Env;
 
@@ -1266,9 +1276,13 @@ public class ConsoleWorker
             await Task.Delay(500, ct);
             try
             {
-                int cols = Console.WindowWidth;
+                int rawCols = Console.WindowWidth;
                 int rows = Console.WindowHeight;
-                if (cols > 0 && rows > 0 && (cols != lastCols || rows != lastRows))
+                // Floor PTY width at 200 to prevent mid-word soft-wraps in
+                // AI-captured output. Matches the spawn-time policy at the
+                // top of this file — keep the two branches in sync.
+                int cols = Math.Max(rawCols, 200);
+                if (rawCols > 0 && rows > 0 && (cols != lastCols || rows != lastRows))
                 {
                     lastCols = cols;
                     lastRows = rows;
