@@ -191,6 +191,11 @@ capabilities:
   # when a human starts typing. Leave user-busy detection off — the AI
   # tracker still works because ripple controls send_input directly.
   user_busy_detection: none
+  # `import os` is self-contained so the cd_command works even on a
+  # fresh REPL session where os hasn't been imported yet. Repeated
+  # imports are idempotent (the module is cached in sys.modules).
+  cd_command: 'import os; os.chdir("{path}")'
+  cd_command_quote: c_style_double_quote
 
 probe:
   eval: "1 + 1"

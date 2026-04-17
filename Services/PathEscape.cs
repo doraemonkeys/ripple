@@ -33,6 +33,17 @@ internal enum QuoteContext
     /// and other bytes are literal.
     /// </summary>
     DoubleQuoteCmd,
+
+    /// <summary>
+    /// C-family double-quoted string literal (Python, JavaScript/Node,
+    /// and others). Inside <c>"..."</c> the escape character is
+    /// backslash: <c>\</c> is spelled <c>\\</c> and <c>"</c> is
+    /// spelled <c>\"</c>. Notably different from shell single-quote
+    /// semantics — the <c>'\''</c> trick used for bash doesn't work
+    /// here because adjacent string concatenation isn't universal in
+    /// C-style languages.
+    /// </summary>
+    CStyleDoubleQuote,
 }
 
 internal static class PathEscape
@@ -48,6 +59,7 @@ internal static class PathEscape
         "single_quote_posix" => QuoteContext.SingleQuotePosix,
         "single_quote_pwsh" => QuoteContext.SingleQuotePwsh,
         "double_quote_cmd" => QuoteContext.DoubleQuoteCmd,
+        "c_style_double_quote" => QuoteContext.CStyleDoubleQuote,
         _ => null,
     };
 
@@ -65,6 +77,10 @@ internal static class PathEscape
         QuoteContext.SingleQuotePosix => path.Replace("'", "'\\''"),
         QuoteContext.SingleQuotePwsh => path.Replace("'", "''"),
         QuoteContext.DoubleQuoteCmd => path.Replace("\"", "\"\""),
+        // Backslash must be escaped first, otherwise the new backslashes
+        // introduced by the `"` → `\"` pass would get doubled on a second
+        // backslash sweep.
+        QuoteContext.CStyleDoubleQuote => path.Replace("\\", "\\\\").Replace("\"", "\\\""),
         _ => throw new ArgumentOutOfRangeException(nameof(ctx), ctx, null),
     };
 

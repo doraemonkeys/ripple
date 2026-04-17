@@ -543,7 +543,7 @@ Feature flags that the runtime and MCP clients can query.
 | `user_busy_detection` | enum | How to detect the user is typing: `osc_b`, `process_polling`, `none` |
 | `user_busy_detection_params` | object | Tuning params when method is `process_polling` |
 | `cd_command` | string | Template for a runtime cd command accepted by the already-running shell/REPL. `{path}` is substituted with the target cwd after quote-escape. Used for auto-route / auto-spawn / reuse on start_console. Omit for adapters that don't participate in cwd management. |
-| `cd_command_quote` | `single_quote_posix` \| `single_quote_pwsh` \| `double_quote_cmd` | Quote context for the `{path}` substitution in `cd_command`. Required whenever `cd_command` is set. `single_quote_posix` escapes `'` as `'\''` (bash/zsh/sh-family incl. python/node `'...'` contexts); `single_quote_pwsh` escapes `'` as `''` (pwsh/powershell `'...'` context); `double_quote_cmd` escapes `"` as `""` (cmd `"..."` context). |
+| `cd_command_quote` | `single_quote_posix` \| `single_quote_pwsh` \| `double_quote_cmd` \| `c_style_double_quote` | Quote context for the `{path}` substitution in `cd_command`. Required whenever `cd_command` is set. `single_quote_posix` escapes `'` as `'\''` (bash/zsh/sh-family `'...'`); `single_quote_pwsh` escapes `'` as `''` (pwsh/powershell `'...'`); `double_quote_cmd` escapes `"` as `""` (cmd `"..."`); `c_style_double_quote` escapes `\` as `\\` and `"` as `\"` (Python / Node / other C-family double-quoted string literals). |
 
 ---
 

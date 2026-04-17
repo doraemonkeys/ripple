@@ -125,6 +125,9 @@ capabilities:
   job_control: false
   shell_integration: osc633
   user_busy_detection: none
+  # process.chdir is a builtin, no import needed.
+  cd_command: 'process.chdir("{path}")'
+  cd_command_quote: c_style_double_quote
 
 probe:
   eval: "1 + 1"
