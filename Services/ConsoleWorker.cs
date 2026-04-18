@@ -131,6 +131,17 @@ public class ConsoleWorker
     private bool _regexContinuationEscapeSent;
     private bool _regexFirstPromptSeen;
     private readonly CommandTracker _tracker = new();
+
+    // Live VT-100 interpreter fed from ReadOutputLoop — the authoritative
+    // cursor that AnswerAndStripTerminalQueries reads on Unix when replying
+    // to DSR (\x1b[6n). Replaces the static `Console.WindowHeight` row +
+    // adapter-specific EstimateCursorCol approximation that caused PSReadLine
+    // history recall to paint over the active prompt after ~5-10 AI commands
+    // (see scratch/unix-vt-parity.md). On Windows ConPTY intercepts DSR
+    // before ripple sees it, so this field is maintained but its cursor is
+    // not consulted — the cost is per-byte CSI parsing overhead on the read
+    // loop, expected <5% on large outputs.
+    private VtLiteState _vtState = new(30, 200);
     private bool _ready;
     private volatile int _outputLength;
     // Controls whether PTY output is mirrored to the worker's visible console.
@@ -383,6 +394,7 @@ public class ConsoleWorker
             inheritEnvironment: inheritEnv,
             envOverrides: envOverrides);
         _tracker.SetTerminalSize(cols, rows);
+        _vtState = new VtLiteState(rows, cols);
         _writer = _pty.InputStream;
 
         // Start reading PTY output on dedicated thread (feeds OscParser + CommandTracker)
@@ -1401,6 +1413,11 @@ public class ConsoleWorker
                     lastRows = rows;
                     _pty?.Resize(cols, rows);
                     _tracker.SetTerminalSize(cols, rows);
+                    // Reset VtLiteState on resize — its grid is fixed-size
+                    // and existing cursor coordinates are invalid in the new
+                    // geometry. Shells typically repaint after resize anyway,
+                    // so the next chunk re-establishes correct state.
+                    _vtState = new VtLiteState(rows, cols);
                     Log($"Resized PTY to {cols}x{rows}");
                 }
             }
@@ -1803,16 +1820,14 @@ public class ConsoleWorker
     ///
     /// Currently handled:
     ///   • CSI 6 n (DSR — Device Status Report: cursor position). Answered
-    ///     with a "near the bottom of the screen" row so PSReadLine's
-    ///     upward-relative moves (history recall re-renders the previous
-    ///     prompt line by moving cursor up and rewriting) land on real
-    ///     screen rows instead of walking off the top. The row we pick
-    ///     is max(terminal.Rows - 1, 1). Col is 1, matching the typical
-    ///     state right after a fresh prompt. The outer terminal would
-    ///     report a more precise value, but forwarding its reply through
-    ///     our stdin relay has subtle timing + xrdp-passthrough issues —
-    ///     a static "safe lower bound" is a pragmatic compromise until a
-    ///     full virtual-terminal-tracking implementation lands.
+    ///     from the live <see cref="VtLiteState"/> that ReadOutputLoop
+    ///     advances on every PTY chunk, so the reply reflects the real
+    ///     cursor position after everything the shell has printed up to
+    ///     the query. During the pre-first-chunk window (cursor still at
+    ///     origin) falls back to a static "near the bottom" row plus
+    ///     EstimateCursorCol so PSReadLine's startup-sync DSR round-trip
+    ///     lands somewhere plausible. This path is Unix-only in practice:
+    ///     ConPTY on Windows intercepts DSR before ripple ever sees it.
     ///
     /// Future queries to consider: CSI c / CSI &gt; c (DA1 / DA2 device
     /// attribute probes), CSI 14 t / CSI 18 t (window pixel / cell size),
@@ -1831,20 +1846,26 @@ public class ConsoleWorker
         {
             try
             {
-                // Static row = Console.WindowHeight (near the bottom of the
-                // visible viewport): once a shell has printed more than a
-                // screenful of output the real cursor is pinned there by
-                // scrolling anyway, and PSReadLine's relative-move renders
-                // survive a static-bottom answer far better than an
-                // optimistic \n-count tracker that under-shoots whenever
-                // the shell wraps a long line or emits a cursor-position
-                // CSI without an explicit '\n'. The user-observed
-                // "content jumps to the screen bottom after an AI
-                // command" is the cost of this compromise — small empty
-                // space above the prompt instead of wrong-row rendering.
-                int row = 24;
-                try { if (Console.WindowHeight > 1) row = Console.WindowHeight; } catch { }
-                int col = EstimateCursorCol();
+                // Live virtual-terminal tracking: ReadOutputLoop feeds every
+                // PTY chunk into `_vtState` before calling this method, so
+                // its (Row, Col) is authoritative at DSR-reply time. DSR is
+                // 1-indexed; VtLiteState is 0-indexed internally. Fallback
+                // to the legacy static-row + EstimateCursorCol heuristic
+                // only during the brief window before the first chunk
+                // arrives (cursor still at origin, fallback is closer to
+                // what the shell expects during its own startup sync).
+                int row, col;
+                if (_vtState.Row == 0 && _vtState.Col == 0)
+                {
+                    row = 24;
+                    try { if (Console.WindowHeight > 1) row = Console.WindowHeight; } catch { }
+                    col = EstimateCursorCol();
+                }
+                else
+                {
+                    row = _vtState.Row + 1;
+                    col = _vtState.Col + 1;
+                }
                 var reply = System.Text.Encoding.UTF8.GetBytes($"\x1b[{row};{col}R");
                 _writer.Write(reply, 0, reply.Length);
                 _writer.Flush();
@@ -1980,6 +2001,18 @@ public class ConsoleWorker
                     if (read == 0) break;
 
                     var text = Encoding.UTF8.GetString(buffer, 0, read);
+                    // Advance the live VT-100 interpreter with the raw
+                    // chunk BEFORE stripping DSR queries, on Unix only.
+                    // Feeding raw is safe: DSR's final byte ('n') is a
+                    // no-op in ApplyCsi, so the cursor isn't perturbed
+                    // by the query itself. Windows is gated out because
+                    // ConPTY intercepts DSR before ripple sees it (so
+                    // the live cursor is dead code there) and the
+                    // per-byte CSI parsing was observed to introduce
+                    // intermittent timing jitter on the deno
+                    // adapter-tests sequence.
+                    if (!OperatingSystem.IsWindows())
+                        _vtState.Feed(text.AsSpan());
                     text = AnswerAndStripTerminalQueries(text);
                     if (_tracker.Busy) Log($"RAW: {EscapeForLog(text)}");
                     var result = _parser.Parse(text);

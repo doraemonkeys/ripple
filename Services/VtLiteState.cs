@@ -1,0 +1,550 @@
+using System.Text;
+
+namespace Ripple.Services;
+
+/// <summary>
+/// Light VT-100 / ECMA-48 interpreter — a fixed-viewport terminal emulator
+/// strong enough to track cursor + screen state across PTY output.
+///
+/// Two consumption modes:
+///   • <b>One-shot</b> — <see cref="VtLite"/> feeds a complete string and
+///     returns a final-state snapshot. Used by <c>peek_console</c> /
+///     <c>GetRecentOutputSnapshot</c>.
+///   • <b>Streaming</b> — call <see cref="Feed"/> repeatedly with PTY
+///     chunks. A pending-escape buffer stitches CSI / OSC sequences
+///     that straddle chunk boundaries so cursor state stays correct
+///     when an escape is split across two PTY reads. Used by the Unix
+///     read loop to maintain an authoritative cursor that the DSR
+///     (\x1b[6n) reply path can read from.
+///
+/// Implemented VT-medium subset:
+///   - Soft line wrap at the right margin
+///   - LF scrolling within the scroll region (DECSTBM, \e[top;bottom r)
+///   - Primary + alternate screen buffers (\e[?1049h/l, ?1047, ?47)
+///   - Save / restore cursor (\e7 / \e8, \e[s / \e[u)
+///   - CUP / HVP / CUU / CUD / CUF / CUB / CHA / VPA
+///   - EL / ED (erase in line / display)
+///   - SGR / DSR / DA finals are no-ops for cursor math (correct: SGR
+///     never advances the cursor; DSR / DA are queries, not state).
+/// </summary>
+public sealed class VtLiteState
+{
+    public readonly int ViewRows;
+    public readonly int ViewCols;
+
+    // Primary and alternate screen buffers.
+    private readonly char[][] _primary;
+    private readonly char[][] _alternate;
+    private bool _useAlternate;
+
+    // Cursor position per buffer.
+    private int _pRow, _pCol;
+    private int _aRow, _aCol;
+
+    // Saved cursor (DEC save/restore).
+    private int _savedRow, _savedCol;
+
+    // Scroll region (0-indexed, inclusive on both ends).
+    private int _scrollTop;
+    private int _scrollBottom;
+
+    // Streaming chunk-boundary buffer for incomplete escape sequences.
+    // Bounded so a malformed unterminated OSC payload cannot grow without
+    // limit; on overflow the tail is dropped and the cursor stays sane.
+    private const int PendingMaxChars = 16 * 1024;
+    private readonly StringBuilder _pending = new();
+
+    private char[][] Grid => _useAlternate ? _alternate : _primary;
+    public int Row
+    {
+        get => _useAlternate ? _aRow : _pRow;
+        set { if (_useAlternate) _aRow = value; else _pRow = value; }
+    }
+    public int Col
+    {
+        get => _useAlternate ? _aCol : _pCol;
+        set { if (_useAlternate) _aCol = value; else _pCol = value; }
+    }
+
+    /// <summary>True while the alternate screen buffer is active (\e[?1049h).</summary>
+    public bool IsAlternateBuffer => _useAlternate;
+
+    public VtLiteState(int rows, int cols)
+    {
+        ViewRows = Math.Max(1, rows);
+        ViewCols = Math.Max(1, cols);
+        _primary = CreateGrid(ViewRows, ViewCols);
+        _alternate = CreateGrid(ViewRows, ViewCols);
+        _scrollTop = 0;
+        _scrollBottom = ViewRows - 1;
+    }
+
+    private static char[][] CreateGrid(int rows, int cols)
+    {
+        var grid = new char[rows][];
+        for (int i = 0; i < rows; i++)
+        {
+            grid[i] = new char[cols];
+            Array.Fill(grid[i], ' ');
+        }
+        return grid;
+    }
+
+    public void WriteChar(char c)
+    {
+        // Auto-wrap at right margin.
+        if (Col >= ViewCols)
+        {
+            Col = 0;
+            if (Row == _scrollBottom)
+                ScrollUp(1);
+            else if (Row < ViewRows - 1)
+                Row++;
+        }
+        Grid[Row][Col] = c;
+        Col++;
+    }
+
+    public void LineFeed()
+    {
+        if (Row == _scrollBottom)
+            ScrollUp(1);
+        else if (Row < ViewRows - 1)
+            Row++;
+    }
+
+    public void ReverseIndex()
+    {
+        if (Row == _scrollTop)
+            ScrollDown(1);
+        else if (Row > 0)
+            Row--;
+    }
+
+    private void ScrollUp(int n)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            var top = Grid[_scrollTop];
+            for (int r = _scrollTop; r < _scrollBottom; r++)
+                Grid[r] = Grid[r + 1];
+            Array.Fill(top, ' ');
+            Grid[_scrollBottom] = top;
+        }
+    }
+
+    private void ScrollDown(int n)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            var bot = Grid[_scrollBottom];
+            for (int r = _scrollBottom; r > _scrollTop; r--)
+                Grid[r] = Grid[r - 1];
+            Array.Fill(bot, ' ');
+            Grid[_scrollTop] = bot;
+        }
+    }
+
+    public void CarriageReturn() { Col = 0; }
+    public void Backspace() { if (Col > 0) Col--; }
+    public void Tab() { Col = Math.Min(((Col / 8) + 1) * 8, ViewCols - 1); }
+
+    public void CursorUp(int n) { Row = Math.Max(0, Row - Math.Max(1, n)); }
+    public void CursorDown(int n) { Row = Math.Min(ViewRows - 1, Row + Math.Max(1, n)); }
+    public void CursorForward(int n) { Col = Math.Min(ViewCols - 1, Col + Math.Max(1, n)); }
+    public void CursorBack(int n) { Col = Math.Max(0, Col - Math.Max(1, n)); }
+    public void CursorCol(int c1) { Col = Math.Clamp(c1 - 1, 0, ViewCols - 1); }
+
+    public void CursorPos(int r1, int c1)
+    {
+        Row = Math.Clamp(r1 - 1, 0, ViewRows - 1);
+        Col = Math.Clamp(c1 - 1, 0, ViewCols - 1);
+    }
+
+    public void SaveCursor() { _savedRow = Row; _savedCol = Col; }
+    public void RestoreCursor() { Row = _savedRow; Col = _savedCol; }
+
+    public void SetScrollRegion(int top1, int bottom1)
+    {
+        _scrollTop = Math.Clamp(top1 - 1, 0, ViewRows - 1);
+        _scrollBottom = Math.Clamp(bottom1 - 1, 0, ViewRows - 1);
+        if (_scrollTop > _scrollBottom)
+        {
+            _scrollTop = 0;
+            _scrollBottom = ViewRows - 1;
+        }
+        // DECSTBM resets cursor to home.
+        Row = 0;
+        Col = 0;
+    }
+
+    public void SwitchToAlternate()
+    {
+        if (_useAlternate) return;
+        SaveCursor();
+        _useAlternate = true;
+        ClearGrid(_alternate);
+        _aRow = 0;
+        _aCol = 0;
+        _scrollTop = 0;
+        _scrollBottom = ViewRows - 1;
+    }
+
+    public void SwitchToPrimary()
+    {
+        if (!_useAlternate) return;
+        _useAlternate = false;
+        _scrollTop = 0;
+        _scrollBottom = ViewRows - 1;
+        RestoreCursor();
+    }
+
+    private static void ClearGrid(char[][] grid)
+    {
+        for (int r = 0; r < grid.Length; r++) Array.Fill(grid[r], ' ');
+    }
+
+    public void EraseLine(int mode)
+    {
+        var row = Grid[Row];
+        if (mode == 0) // cursor to end
+        {
+            for (int c = Col; c < ViewCols; c++) row[c] = ' ';
+        }
+        else if (mode == 1) // start to cursor
+        {
+            for (int c = 0; c <= Math.Min(Col, ViewCols - 1); c++) row[c] = ' ';
+        }
+        else if (mode == 2) // whole line
+        {
+            Array.Fill(row, ' ');
+        }
+    }
+
+    public void EraseDisplay(int mode)
+    {
+        if (mode == 0)
+        {
+            EraseLine(0);
+            for (int r = Row + 1; r < ViewRows; r++) Array.Fill(Grid[r], ' ');
+        }
+        else if (mode == 1)
+        {
+            for (int r = 0; r < Row; r++) Array.Fill(Grid[r], ' ');
+            EraseLine(1);
+        }
+        else if (mode == 2)
+        {
+            ClearGrid(Grid);
+            Row = 0;
+            Col = 0;
+        }
+    }
+
+    /// <summary>
+    /// ECH — erase N characters at cursor without moving cursor. Heavily
+    /// used by readline / PSReadLine to clear part of the input line
+    /// during in-line editing without a full \r + redraw cycle.
+    /// </summary>
+    public void EraseChars(int n)
+    {
+        var row = Grid[Row];
+        int end = Math.Min(Col + Math.Max(1, n), ViewCols);
+        for (int c = Col; c < end; c++) row[c] = ' ';
+    }
+
+    /// <summary>
+    /// DCH — delete N characters at cursor; trailing chars on the line
+    /// shift left. Cursor unchanged. Right-margin slots fill with blanks.
+    /// Emitted by readline when the user backspaces / deletes mid-line.
+    /// </summary>
+    public void DeleteChars(int n)
+    {
+        var row = Grid[Row];
+        n = Math.Max(1, Math.Min(n, ViewCols - Col));
+        for (int c = Col; c < ViewCols - n; c++) row[c] = row[c + n];
+        for (int c = ViewCols - n; c < ViewCols; c++) row[c] = ' ';
+    }
+
+    /// <summary>
+    /// ICH — insert N blank characters at cursor; existing chars shift
+    /// right and any beyond the right margin are lost. Cursor unchanged.
+    /// Emitted by readline when the user types in the middle of a line.
+    /// </summary>
+    public void InsertChars(int n)
+    {
+        var row = Grid[Row];
+        n = Math.Max(1, Math.Min(n, ViewCols - Col));
+        for (int c = ViewCols - 1; c >= Col + n; c--) row[c] = row[c - n];
+        for (int c = Col; c < Col + n; c++) row[c] = ' ';
+    }
+
+    /// <summary>
+    /// IL — insert N blank lines at and below the cursor row, within the
+    /// scroll region. Lines below shift down; lines pushed past
+    /// scrollBottom are lost. Cursor unchanged. Emitted by full-screen
+    /// editors and some readline variants on multi-line input.
+    /// </summary>
+    public void InsertLines(int n)
+    {
+        if (Row < _scrollTop || Row > _scrollBottom) return;
+        n = Math.Max(1, Math.Min(n, _scrollBottom - Row + 1));
+        for (int i = 0; i < n; i++)
+        {
+            var bot = Grid[_scrollBottom];
+            for (int r = _scrollBottom; r > Row; r--) Grid[r] = Grid[r - 1];
+            Array.Fill(bot, ' ');
+            Grid[Row] = bot;
+        }
+    }
+
+    /// <summary>
+    /// DL — delete N lines at and below the cursor row, within the
+    /// scroll region. Lines below shift up; new blank lines fill from
+    /// the bottom. Cursor unchanged.
+    /// </summary>
+    public void DeleteLines(int n)
+    {
+        if (Row < _scrollTop || Row > _scrollBottom) return;
+        n = Math.Max(1, Math.Min(n, _scrollBottom - Row + 1));
+        for (int i = 0; i < n; i++)
+        {
+            var top = Grid[Row];
+            for (int r = Row; r < _scrollBottom; r++) Grid[r] = Grid[r + 1];
+            Array.Fill(top, ' ');
+            Grid[_scrollBottom] = top;
+        }
+    }
+
+    /// <summary>
+    /// Streaming feed entry — call repeatedly with successive PTY chunks.
+    /// Pending incomplete escape sequences are buffered internally and
+    /// stitched to the next call so a CSI / OSC split across two PTY
+    /// reads still produces correct cursor state. Safe to call with an
+    /// empty span as a no-op.
+    /// </summary>
+    public void Feed(ReadOnlySpan<char> input)
+    {
+        string text;
+        if (_pending.Length > 0)
+        {
+            _pending.Append(input);
+            text = _pending.ToString();
+            _pending.Clear();
+        }
+        else if (input.Length == 0)
+        {
+            return;
+        }
+        else
+        {
+            text = new string(input);
+        }
+
+        int i = 0;
+        while (i < text.Length)
+        {
+            char c = text[i];
+            if (c == '\n') { LineFeed(); i++; }
+            else if (c == '\r') { CarriageReturn(); i++; }
+            else if (c == '\b') { Backspace(); i++; }
+            else if (c == '\t') { Tab(); i++; }
+            else if (c == '\x1b')
+            {
+                int next = ParseEscape(text, i, this);
+                if (next < 0)
+                {
+                    // Incomplete escape — buffer the tail for the next feed.
+                    int tailLen = text.Length - i;
+                    if (tailLen <= PendingMaxChars)
+                        _pending.Append(text, i, tailLen);
+                    // else: runaway sequence, drop and keep cursor sane.
+                    return;
+                }
+                i = next;
+            }
+            else if (c >= ' ') { WriteChar(c); i++; }
+            else { i++; /* drop other C0 */ }
+        }
+    }
+
+    /// <summary>
+    /// Render the current grid as a final-state snapshot — trailing blank
+    /// rows and trailing spaces per row are trimmed. Used by peek_console.
+    /// Cursor state is unchanged.
+    /// </summary>
+    public string Render()
+    {
+        // Find last non-blank row.
+        int lastNonBlank = -1;
+        for (int r = ViewRows - 1; r >= 0; r--)
+        {
+            for (int c = 0; c < ViewCols; c++)
+            {
+                if (Grid[r][c] != ' ') { lastNonBlank = r; goto done; }
+            }
+        }
+        done:
+        if (lastNonBlank < 0) return "";
+
+        var sb = new StringBuilder();
+        for (int r = 0; r <= lastNonBlank; r++)
+        {
+            if (r > 0) sb.Append('\n');
+            int end = ViewCols - 1;
+            while (end >= 0 && Grid[r][end] == ' ') end--;
+            if (end >= 0) sb.Append(new string(Grid[r], 0, end + 1));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// One-shot helper — feed a complete string and return the final
+    /// snapshot. Equivalent to:
+    ///   <c>var s = new VtLiteState(rows, cols); s.Feed(input); return s.Render();</c>
+    /// Any unterminated trailing escape in <paramref name="input"/> is
+    /// dropped (the streaming pending-buffer never gets flushed in a
+    /// one-shot call), preserving the prior <c>VtLite()</c> behavior.
+    /// </summary>
+    public static string VtLite(string input, int viewRows = 30, int viewCols = 120)
+    {
+        var state = new VtLiteState(viewRows, viewCols);
+        state.Feed(input.AsSpan());
+        return state.Render();
+    }
+
+    /// <summary>
+    /// Parse an ESC sequence starting at <paramref name="start"/>
+    /// (where input[start] == 0x1b), mutate <paramref name="state"/>,
+    /// and return the index of the byte immediately after the sequence.
+    /// Returns -1 if the sequence ran past end-of-input mid-parse: the
+    /// streaming caller buffers the tail for the next feed; the one-shot
+    /// caller treats -1 as "drop the rest".
+    /// </summary>
+    private static int ParseEscape(string input, int start, VtLiteState state)
+    {
+        int i = start + 1;
+        if (i >= input.Length) return -1; // bare ESC at boundary
+
+        char next = input[i];
+        if (next == '[')
+        {
+            // CSI — \e[<param bytes><intermediate><final>
+            int paramStart = i + 1;
+            int j = paramStart;
+            while (j < input.Length && input[j] >= 0x30 && input[j] <= 0x3f) j++;
+            var paramsStr = j > paramStart ? input.Substring(paramStart, j - paramStart) : "";
+            while (j < input.Length && input[j] >= 0x20 && input[j] <= 0x2f) j++;
+            if (j >= input.Length) return -1; // CSI without final byte
+            char final = input[j];
+            ApplyCsi(paramsStr, final, state);
+            return j + 1;
+        }
+        if (next == ']')
+        {
+            // OSC — \e]...(BEL or ST). Drop entire sequence.
+            int j = i + 1;
+            bool terminated = false;
+            while (j < input.Length)
+            {
+                if (input[j] == '\x07') { j++; terminated = true; break; }
+                if (input[j] == '\x1b')
+                {
+                    if (j + 1 >= input.Length) return -1; // ESC at boundary
+                    if (input[j + 1] == '\\') { j += 2; terminated = true; break; }
+                    j += 2; // ESC followed by something else mid-OSC — skip both
+                    continue;
+                }
+                j++;
+            }
+            if (!terminated) return -1; // ran out without BEL / ST
+            return j;
+        }
+        if (next == '(' || next == ')')
+        {
+            // Character set selection — \e(<char>
+            if (i + 1 >= input.Length) return -1;
+            return i + 2;
+        }
+        if (next == '7') { state.SaveCursor(); return i + 1; }
+        if (next == '8') { state.RestoreCursor(); return i + 1; }
+        if (next == 'M') { state.ReverseIndex(); return i + 1; }
+        // Other single-char ESC — skip the follower.
+        return i + 1;
+    }
+
+    private static void ApplyCsi(string paramsStr, char final, VtLiteState state)
+    {
+        // Private-mode sequences (DEC — \e[?...h / \e[?...l).
+        if (paramsStr.Length > 0 && paramsStr[0] == '?')
+        {
+            // Only handle alternate screen buffer toggle.
+            var modeStr = paramsStr.Substring(1);
+            if (modeStr == "1049" || modeStr == "1047" || modeStr == "47")
+            {
+                if (final == 'h') state.SwitchToAlternate();
+                else if (final == 'l') state.SwitchToPrimary();
+            }
+            return;
+        }
+
+        // Parse semicolon-separated numeric params. Empty == default.
+        string[] parts;
+        if (paramsStr.Length == 0) parts = Array.Empty<string>();
+        else parts = paramsStr.Split(';');
+
+        int Param(int idx, int def)
+        {
+            if (idx >= parts.Length) return def;
+            if (string.IsNullOrEmpty(parts[idx])) return def;
+            if (int.TryParse(parts[idx], out var n)) return n;
+            return def;
+        }
+
+        switch (final)
+        {
+            case 'A': state.CursorUp(Param(0, 1)); break;         // CUU
+            case 'B': state.CursorDown(Param(0, 1)); break;       // CUD
+            case 'C': state.CursorForward(Param(0, 1)); break;    // CUF
+            case 'D': state.CursorBack(Param(0, 1)); break;       // CUB
+            case 'E': state.CursorDown(Param(0, 1)); state.Col = 0; break; // CNL
+            case 'F': state.CursorUp(Param(0, 1)); state.Col = 0; break;   // CPL
+            case 'G': state.CursorCol(Param(0, 1)); break;        // CHA
+            case 'H':                                              // CUP
+            case 'f':                                              // HVP
+                state.CursorPos(Param(0, 1), Param(1, 1));
+                break;
+            case 'K': state.EraseLine(Param(0, 0)); break;        // EL
+            case 'J': state.EraseDisplay(Param(0, 0)); break;     // ED
+            case 'X': state.EraseChars(Param(0, 1)); break;       // ECH
+            case 'P': state.DeleteChars(Param(0, 1)); break;      // DCH
+            case '@': state.InsertChars(Param(0, 1)); break;      // ICH
+            case 'L': state.InsertLines(Param(0, 1)); break;      // IL
+            case 'M': state.DeleteLines(Param(0, 1)); break;      // DL
+            case 'd': state.Row = Math.Clamp(Param(0, 1) - 1, 0, state.ViewRows - 1); break; // VPA
+            case 't':
+                // DEC / xterm window manipulation — e.g. \e[8;<h>;<w>t to
+                // resize the text area. ConPTY emits this as the prelude
+                // to a full-screen refresh: after the `t` sequence it
+                // repaints the entire viewport starting from \e[H. Treat
+                // it as a full clear so our grid stays in sync with
+                // ConPTY's viewport and doesn't carry stale content
+                // (PSReadLine prediction artifacts, prior command
+                // fragments) forward from before the refresh.
+                state.EraseDisplay(2);
+                break;
+            case 's': state.SaveCursor(); break;
+            case 'u': state.RestoreCursor(); break;
+            case 'r': // DECSTBM — scroll region
+                state.SetScrollRegion(Param(0, 1), Param(1, state.ViewRows));
+                break;
+            case 'm': // SGR — colors/attrs, no-op
+            case 'n': // device status report
+            case 'c': // device attributes
+                break;
+            default:
+                // Unknown final byte — drop silently.
+                break;
+        }
+    }
+}

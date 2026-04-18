@@ -90,6 +90,7 @@ public class Program
             }
             Tests.OscParserTests.Run();
             Tests.CommandTrackerTests.Run();
+            Tests.VtLiteStateTests.Run();
             Tests.PwshColorizerTests.Run();
             Tests.ConsoleManagerTests.Run();
             Tests.ConsoleWorkerTests.RunUnitTests();
