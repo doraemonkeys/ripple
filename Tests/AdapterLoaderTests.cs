@@ -74,16 +74,18 @@ public static class AdapterLoaderTests
                 "pwsh: capabilities.exit_code == true");
         }
 
-        // bash-specific: PS0 hook, direct multiline delivery, and the
-        // empirically-verified line-editor clear_line opt-in that
-        // flushes buffered user keystrokes before each AI command
-        // (see commit c90d3f1 for context).
+        // bash-specific: PS0 hook, tempfile multiline delivery (corrected
+        // in e5fec38 — the yaml used to claim 'direct' but HandleExecuteAsync
+        // has always routed bash multiline through the hardcoded
+        // isMultiLinePosix tempfile path), and the empirically-verified
+        // line-editor clear_line opt-in that flushes buffered user
+        // keystrokes before each AI command (see commit c90d3f1 for context).
         var bash = registry.Find("bash");
         if (bash != null)
         {
             Assert(bash.Init.HookType == "ps0", "bash: init.hook_type == ps0");
-            Assert(bash.Input.MultilineDelivery == "direct",
-                "bash: input.multiline_delivery == direct");
+            Assert(bash.Input.MultilineDelivery == "tempfile",
+                "bash: input.multiline_delivery == tempfile");
             Assert(bash.Process.InheritEnvironment == true,
                 "bash: process.inherit_environment == true (MSYS2 needs it)");
             Assert(bash.Capabilities.JobControl == true,
