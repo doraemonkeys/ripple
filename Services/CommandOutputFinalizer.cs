@@ -83,8 +83,17 @@ internal static class CommandOutputFinalizer
             // OutputTruncationHelper will immediately spill if the
             // cleaned stream is over threshold, so callers shouldn't
             // rely on us staying under MaxInlineSliceChars here.
+            //
+            // No initial capacity hint: `length` is the caller-provided
+            // upper bound and only gets clamped inside OpenSliceReader,
+            // so a mismatched commandEnd against a tiny capture would
+            // otherwise pre-allocate up to int.MaxValue chars (~4 GB)
+            // before the reader reports the real smaller size. Letting
+            // the StringBuilder grow on demand costs a few reallocs on
+            // the large-slice path and nothing at all when the slice is
+            // bogus.
             using var reader = capture.OpenSliceReader(commandStart, length);
-            var sb = new StringBuilder(checked((int)Math.Min(length, int.MaxValue)));
+            var sb = new StringBuilder();
             var buf = new char[8 * 1024];
             int n;
             while ((n = reader.Read(buf, 0, buf.Length)) > 0)
