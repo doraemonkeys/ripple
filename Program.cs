@@ -5,6 +5,7 @@ using ModelContextProtocol;
 using Ripple.Services;
 using Ripple.Services.Adapters;
 using Ripple.Tools;
+using System.Text;
 
 namespace Ripple;
 
@@ -12,6 +13,11 @@ public class Program
 {
     public static async Task Main(string[] args)
     {
+        // Register legacy codepages (Shift-JIS, EUC-JP, GBK, Big5, windows-125x, …)
+        // so FileTools can read/write non-UTF-8 text files. CodePagesEncodingProvider
+        // carries its own tables, so this works under InvariantGlobalization + AOT.
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
         // Load adapter registry once at startup. Shared across proxy and
         // worker processes: both call Program.Main, so SetDefault runs in
         // both modes and ConsoleWorker / ConsoleManager can read the
@@ -90,6 +96,7 @@ public class Program
             Tests.RegexPromptDetectorTests.Run();
             Tests.BalancedParensCounterTests.Run();
             Tests.ModeDetectorTests.Run();
+            Tests.FileToolsTests.Run();
             Tests.AdapterLoaderTests.Run(registry, adapterReport);
             if (args.Contains("--e2e"))
             {
