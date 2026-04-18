@@ -294,12 +294,18 @@ public class FileTools
 
     // ToLf/FromLf: round-trip through \n for matching in EditFile,
     // then re-emit with the file's original newline sequence on write.
-    private static string ToLf(string s, string originalNewline) => originalNewline switch
-    {
-        "\r\n" => s.Replace("\r\n", "\n"),
-        "\r" => s.Replace("\r", "\n"),
-        _ => s,
-    };
+    //
+    // ToLf always normalises every newline flavour (\r\n + orphan \r) to
+    // \n regardless of the file's own line ending — the AI-supplied
+    // old_string / new_string can arrive with whatever newlines the
+    // client happened to send (Windows clipboard CRLF, VS Code LF, etc.),
+    // and pre-2026-04-18 this branched on the file's newline so an AI
+    // editing a LF file with CRLF in old_string silently missed. Normal
+    // files (pure LF / pure CRLF / pure CR) are unchanged by the double-
+    // replace; only mixed-newline files see any difference, and for those
+    // "match in LF-space" is still the correct behaviour.
+    private static string ToLf(string s, string originalNewline)
+        => s.Replace("\r\n", "\n").Replace("\r", "\n");
 
     private static string FromLf(string s, string originalNewline) => originalNewline switch
     {

@@ -142,6 +142,36 @@ public static class FileToolsTests
                 Assert(after == "LINE1\r\nLINE2\r\nline3\r\n", $"multi-line edit preserves CRLF (got [{after.Replace("\r", "\\r").Replace("\n", "\\n")}])");
             }
 
+            // --- EditFile: LF file + CRLF old_string (the opposite direction).
+            // Pre-2026-04-18 this silently missed — ToLf only normalised when
+            // the file's own newline was the one being replaced, so a LF file's
+            // content stayed LF while a CRLF-carrying old_string kept its \r\n
+            // and IndexOf failed. AI clients pasting Windows-clipboard snippets
+            // into an LF-native file (the common case for any repo with a
+            // mixed team) hit this silently. Regression test.
+
+            {
+                var p = Path.Combine(tmpRoot, "lf-file-crlf-oldstring.txt");
+                File.WriteAllText(p, "alpha\nbeta\ngamma\n", new UTF8Encoding(false));
+                var result = FileTools.EditFile(p, "alpha\r\nbeta", "A\r\nB").GetAwaiter().GetResult();
+                Assert(result.StartsWith("Replaced 1"), $"LF file + CRLF old_string matches ({result})");
+                var after = File.ReadAllText(p, new UTF8Encoding(false));
+                Assert(after == "A\nB\ngamma\n", $"LF file preserves LF on write (got [{after.Replace("\r", "\\r").Replace("\n", "\\n")}])");
+            }
+
+            // --- EditFile: mixed-newline old_string (\n and \r\n together)
+            // against a LF file. Normalisation has to flatten every flavour,
+            // not just the file's own newline.
+
+            {
+                var p = Path.Combine(tmpRoot, "mixed-newline-oldstring.txt");
+                File.WriteAllText(p, "x\ny\nz\n", new UTF8Encoding(false));
+                var result = FileTools.EditFile(p, "x\r\ny\nz", "P\nQ\nR").GetAwaiter().GetResult();
+                Assert(result.StartsWith("Replaced 1"), $"LF file + mixed-newline old_string ({result})");
+                var after = File.ReadAllText(p, new UTF8Encoding(false));
+                Assert(after == "P\nQ\nR\n", $"mixed-newline old_string resolves on LF file (got [{after.Replace("\r", "\\r").Replace("\n", "\\n")}])");
+            }
+
             // --- WriteFile overwrite preserves encoding + newline ---
 
             {
