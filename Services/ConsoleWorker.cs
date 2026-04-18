@@ -2717,18 +2717,48 @@ public class ConsoleWorker
                 // tracker's bounded in-flight partial (NOT a spill
                 // preview) as diagnostic context.
                 //
-                // Detach THIS command's inline-delivery TCS from the
-                // routing dictionary: the HTTP/pipe response has moved
-                // on and nobody will await this task again. Without the
-                // removal, FinalizeSnapshotAsync's Step 6 would still
-                // find the TCS under our id and call TrySetResult on
-                // it — delivering the snapshot into an orphaned awaiter
-                // instead of _cachedResults, so wait_for_completion
-                // would never drain the cached result (worker would
-                // report "standby" with empty cache). Matches the
-                // plan §2 guarantee that timed-out commands route into
-                // cache via the finalize-once path.
-                lock (_cacheLock) _inlineDeliveriesById.Remove(inlineDeliveryId);
+                // Race window (CodeRabbit finding #3): Task.WhenAny above
+                // only proves SOME task completed first — between that
+                // and here, FinalizeSnapshotAsync can still run its
+                // Step 6 and TrySetResult on our inline TCS. If we
+                // unconditionally remove the slot and ignore the inline
+                // TCS, that successfully-delivered CommandResult becomes
+                // orphaned on a TCS nobody awaits AND is never appended
+                // to _cachedResults, so wait_for_completion later reports
+                // `no_cache`. Close the window atomically:
+                //
+                //   1. Under _cacheLock, TrySetCanceled the inline TCS.
+                //      - Returns true  → we won the race; finalize has
+                //        not yet reached its Step 6 (or will observe
+                //        the cancellation and fall through to the
+                //        _cachedResults branch because its guard
+                //        `!pending.Task.IsCompleted` is false for a
+                //        cancelled task). Remove the entry and return
+                //        the timed-out payload.
+                //      - Returns false → finalize beat us and already
+                //        called TrySetResult (IsCompletedSuccessfully
+                //        on the inline task). The dictionary entry was
+                //        already removed by finalize's Step 6. The
+                //        command actually completed inside the timeout
+                //        window; surface the real result instead of a
+                //        synthetic timeout.
+                //   2. Removal lives inside the same lock as the
+                //      TrySetCanceled call so no concurrent finalize
+                //      can squeeze in after we cancel but before we
+                //      remove (which would leave a cancelled entry
+                //      stranded in _inlineDeliveriesById).
+                bool weWonRace;
+                lock (_cacheLock)
+                {
+                    weWonRace = inlineDelivery.TrySetCanceled();
+                    if (weWonRace) _inlineDeliveriesById.Remove(inlineDeliveryId);
+                }
+                if (!weWonRace)
+                {
+                    var raceResponse = await TryResolveTimeoutRaceLossAsync(
+                        inlineDelivery, ct);
+                    if (raceResponse is JsonElement r) return r;
+                }
                 var partial = _tracker.GetCurrentCommandSnapshot();
                 return SerializeResponse(w =>
                 {
@@ -2795,26 +2825,39 @@ public class ConsoleWorker
             });
         }
         ReleaseHeldUserInput();
+        return await BuildExecuteSuccessResponseAsync(result, ct);
+    }
 
-        // Re-evaluate which mode the REPL is now in. The detector
-        // scans the tail of recent terminal output against every
-        // auto_enter mode's detect regex; falls back to the
-        // adapter's default mode otherwise. Result is cached on
-        // the worker so get_status / cached_output can report the
-        // same value without re-scanning.
-        //
-        // Scans the recent-output ring rather than the OSC-C..D
-        // slice because the mode transition is visible in the
-        // NEXT prompt (e.g. CCL drops to `1 > ` after an error),
-        // which arrives AFTER the OSC A that fires Resolve — so
-        // it's never inside cleanedOutput. The ring is updated
-        // unconditionally by FeedOutput and captures the post-A
-        // prompt as soon as its bytes land. Because ConPTY
-        // typically delivers OSC A and the following prompt
-        // bytes in the same chunk, the ring has the new prompt
-        // by the time we read it; a short poll with a fresh
-        // ring snapshot on each tick covers the rare case where
-        // the prompt trails by a few milliseconds.
+    /// <summary>
+    /// Shared happy-path response builder used by both the normal
+    /// inline-await success arm and the TimeoutException race branch's
+    /// Case 1 (finalize beat us with a successful result). Keeps the
+    /// two paths serializing through a single point so the wire shape —
+    /// including `_currentMode` / `_currentModeLevel` re-evaluation and
+    /// field emission — is guaranteed identical.
+    ///
+    /// Re-evaluates which mode the REPL is now in. The detector scans
+    /// the tail of recent terminal output against every auto_enter
+    /// mode's detect regex; falls back to the adapter's default mode
+    /// otherwise. Result is cached on the worker so get_status /
+    /// cached_output can report the same value without re-scanning.
+    ///
+    /// Scans the recent-output ring rather than the OSC-C..D slice
+    /// because the mode transition is visible in the NEXT prompt
+    /// (e.g. CCL drops to `1 > ` after an error), which arrives AFTER
+    /// the OSC A that fires Resolve — so it's never inside
+    /// cleanedOutput. The ring is updated unconditionally by FeedOutput
+    /// and captures the post-A prompt as soon as its bytes land.
+    /// Because ConPTY typically delivers OSC A and the following prompt
+    /// bytes in the same chunk, the ring has the new prompt by the
+    /// time we read it; a short poll with a fresh ring snapshot on
+    /// each tick covers the rare case where the prompt trails by a
+    /// few milliseconds.
+    /// </summary>
+    private async Task<JsonElement> BuildExecuteSuccessResponseAsync(
+        CommandResult result,
+        CancellationToken ct)
+    {
         if (_adapter?.Modes is { Count: > 0 } modes)
         {
             // Start with an explicit "no match yet" ModeMatch rather
@@ -2864,6 +2907,64 @@ public class ConsoleWorker
                 if (_currentModeLevel.HasValue) w.WriteNumber("currentModeLevel", _currentModeLevel.Value);
             }
         });
+    }
+
+    /// <summary>
+    /// Post-<c>TrySetCanceled</c> dispatch for the
+    /// <c>TimeoutException</c> catch in <see cref="HandleExecuteAsync"/>
+    /// when we LOST the cancel race (finalize beat us into the inline
+    /// TCS). Returns a non-null response if the TCS's terminal state
+    /// tells us the client should observe finalize's actual outcome,
+    /// or null to let the caller fall through to the synthetic
+    /// <c>timedOut:true</c> payload.
+    ///
+    /// Cases:
+    ///   - <c>IsCompletedSuccessfully</c>: finalize delivered a real
+    ///     <see cref="CommandResult"/>. Route through the shared
+    ///     happy-path response builder so the wire shape (including
+    ///     mode re-evaluation and mode fields) is identical to the
+    ///     normal success arm. Finalize's Step 6 removed our dict
+    ///     entry and did NOT append to <c>_cachedResults</c>, so
+    ///     cache invariants hold.
+    ///   - <c>IsFaulted</c>: finalize threw and its catch routed the
+    ///     exception through <c>TrySetException</c> on the still-
+    ///     attached inline TCS. Return the same
+    ///     <c>"finalize failed: &lt;Type&gt;: &lt;message&gt;"</c> shape
+    ///     the normal inline-await catch emits, so the client observes
+    ///     the finalize failure instead of a misleading
+    ///     <c>timedOut:true</c>.
+    ///   - Default: TCS is still not terminal (shouldn't happen past
+    ///     <c>TrySetCanceled</c> returning false — it would imply a
+    ///     pre-existing cancel) — return null and let the caller
+    ///     synthesize the timeout payload.
+    /// </summary>
+    private async Task<JsonElement?> TryResolveTimeoutRaceLossAsync(
+        TaskCompletionSource<CommandResult> inlineDelivery,
+        CancellationToken ct)
+    {
+        if (inlineDelivery.Task.IsCompletedSuccessfully)
+        {
+            return await BuildExecuteSuccessResponseAsync(
+                inlineDelivery.Task.Result, ct);
+        }
+        if (inlineDelivery.Task.IsFaulted)
+        {
+            // Task.Exception is an AggregateException wrapper; peel the
+            // inner exception so the emitted "finalize failed:" string
+            // matches what finalize's own catch at Step 6 produces
+            // against the underlying throw.
+            var aggregate = inlineDelivery.Task.Exception!;
+            var inner = aggregate.InnerException ?? aggregate;
+            return SerializeResponse(w =>
+            {
+                w.WriteString("output", $"finalize failed: {inner.GetType().Name}: {inner.Message}");
+                w.WriteNumber("exitCode", -1);
+                w.WriteNull("cwd");
+                w.WriteString("duration", "0.0");
+                w.WriteBoolean("timedOut", false);
+            });
+        }
+        return null;
     }
 
     /// <summary>
@@ -3421,6 +3522,24 @@ public class ConsoleWorker
     internal int TestGetInlineDeliveryCount()
     {
         lock (_cacheLock) return _inlineDeliveriesById.Count;
+    }
+
+    /// <summary>
+    /// Drives <see cref="TryResolveTimeoutRaceLossAsync"/> with a caller-
+    /// supplied inline TCS so the <c>TimeoutException</c> catch's
+    /// post-cancel-race dispatch can be unit-tested without standing
+    /// up a full pipe/PTY. Callers set the TCS to Faulted /
+    /// CompletedSuccessfully BEFORE invoking this seam, mirroring the
+    /// state finalize's Step 6 leaves the TCS in when finalize wins
+    /// the <c>Task.WhenAny</c> race with the timeout branch.
+    /// Test-only.
+    /// </summary>
+    internal Task<JsonElement?> TestResolveTimeoutRaceLossAsync(
+        TaskCompletionSource<CommandResult> inlineDelivery,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(inlineDelivery);
+        return TryResolveTimeoutRaceLossAsync(inlineDelivery, ct);
     }
 
     /// <summary>

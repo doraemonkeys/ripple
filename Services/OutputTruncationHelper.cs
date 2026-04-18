@@ -327,10 +327,77 @@ internal sealed class DefaultFileSystem : IOutputSpillFileSystem
 {
     public static readonly DefaultFileSystem Instance = new();
 
+    // Owner-only directory mode (0700). Applied on Unix so sibling users
+    // on a shared host (where $TMPDIR falls back to /tmp) can't enumerate
+    // ripple's spill directory. Windows keeps default ACLs — %TEMP% is
+    // per-user and already restricted.
+    internal const UnixFileMode SpillDirectoryMode =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+
+    // Owner-only file mode (0600). Spill files can contain command output
+    // with tokens, paths, or secrets, so they must not be world-readable.
+    internal const UnixFileMode SpillFileMode =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite;
+
     public string GetTempPath() => Path.GetTempPath();
     public bool DirectoryExists(string path) => Directory.Exists(path);
-    public void CreateDirectory(string path) => Directory.CreateDirectory(path);
-    public void WriteAllText(string path, string contents) => File.WriteAllText(path, contents);
+
+    public void CreateDirectory(string path)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Directory.CreateDirectory(path);
+            return;
+        }
+
+        // On Unix, create with 0700 in a single syscall so there's no
+        // umask-dependent window where a wider mode (e.g. 0755) is
+        // briefly observable to another local user. The .NET 8+ overload
+        // applies the mode atomically when the directory is created; for
+        // a pre-existing directory it returns a DirectoryInfo but does
+        // NOT change the mode, so we tighten permissions defensively
+        // below in case a prior run (or the user) left them open.
+        Directory.CreateDirectory(path, SpillDirectoryMode);
+        TrySetUnixFileMode(path, SpillDirectoryMode);
+    }
+
+    public void WriteAllText(string path, string contents)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            File.WriteAllText(path, contents);
+            return;
+        }
+
+        // On Unix, open the file with 0600 at creation time so there's no
+        // 0644-window between WriteAllText's default open and a follow-up
+        // chmod. FileStream(string, FileStreamOptions) with UnixCreateMode
+        // set on FileStreamOptions gives an atomic O_CREAT|O_EXCL-like
+        // creation with the requested mode (net7+). UTF-8 without BOM
+        // mirrors File.WriteAllText's default encoding.
+        var options = new FileStreamOptions
+        {
+            Mode = FileMode.Create,
+            Access = FileAccess.Write,
+            Share = FileShare.None,
+            UnixCreateMode = SpillFileMode,
+        };
+
+        using (var stream = new FileStream(path, options))
+        using (var writer = new StreamWriter(stream, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
+        {
+            writer.Write(contents);
+        }
+
+        // Defensive chmod in case the file already existed (FileMode.Create
+        // truncates but preserves the old mode on some filesystems) or the
+        // UnixCreateMode wasn't honored (e.g. FAT/NFS mounts that don't
+        // track POSIX perms). Failures are logged and swallowed so the
+        // spill still lands — otherwise we'd break the feature on mounts
+        // that can't enforce perms, where the data is already local to
+        // the user anyway.
+        TrySetUnixFileMode(path, SpillFileMode);
+    }
 
     public IEnumerable<string> EnumerateFiles(string directory, string searchPattern)
         => Directory.EnumerateFiles(directory, searchPattern);
@@ -339,4 +406,39 @@ internal sealed class DefaultFileSystem : IOutputSpillFileSystem
         => new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero);
 
     public void DeleteFile(string path) => File.Delete(path);
+
+    // Sets owner-only permissions where possible. Swallows the three
+    // well-known failure modes so the spill path stays robust:
+    //   - IOException: filesystem doesn't support POSIX perms (FAT, some
+    //     NFS mounts, 9p) — data still lands, just at the mount's mode.
+    //   - UnauthorizedAccessException: caller doesn't own the path — rare
+    //     (helper only writes to paths it just created), but safe to
+    //     skip rather than block the spill.
+    //   - PlatformNotSupportedException: belt-and-suspenders guard for
+    //     callers that invoke this on Windows by mistake.
+    private static void TrySetUnixFileMode(string path, UnixFileMode mode)
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        try
+        {
+            File.SetUnixFileMode(path, mode);
+        }
+        catch (IOException ex)
+        {
+            Console.Error.WriteLine(
+                $"[ripple] warn: could not set permissions on '{path}': {ex.Message}");
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Console.Error.WriteLine(
+                $"[ripple] warn: not permitted to set permissions on '{path}': {ex.Message}");
+        }
+        catch (PlatformNotSupportedException)
+        {
+            // Unreachable in practice (guarded by OperatingSystem.IsWindows
+            // above), but keeps the contract honest on exotic runtimes.
+        }
+    }
 }

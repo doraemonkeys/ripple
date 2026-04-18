@@ -54,6 +54,31 @@ public static class SpillIntegrationTests
             else { fail++; Console.Error.WriteLine($"  FAIL: {name}"); }
         }
 
+        // Self-check: the worker-launch/pipe-ready precondition inside
+        // RunWithFreshWorker must signal failure through the Assert
+        // delegate (not a silent return) so a broken fixture can't mask
+        // a real regression as all-pass. Uses a bogus pipe name so
+        // WaitForPipeAsync is guaranteed to time out; we tally into a
+        // scratch counter and roll the result into the main tally via
+        // Assert so the self-check itself counts as one scenario. If a
+        // future refactor reintroduces the silent-skip bug this
+        // assertion flips to FAIL and the suite exits non-zero.
+        {
+            int selfPass = 0, selfFail = 0;
+            void SelfAssert(bool condition, string name)
+            {
+                if (condition) selfPass++; else selfFail++;
+            }
+            await RunWithFreshWorkerCore(
+                scenarioName: "pipe-failure-self-check",
+                assert: SelfAssert,
+                body: (_, _) => Task.CompletedTask,
+                shell: "pwsh.exe",
+                launchWorker: () => throw new InvalidOperationException("injected launch failure"));
+            Assert(selfFail == 1 && selfPass == 0,
+                $"self-check: injected launch failure increments fail counter (pass={selfPass}, fail={selfFail})");
+        }
+
         // Every scenario runs on a fresh worker so a previous scenario's
         // cache state can't bleed into the next assertion set.
 
@@ -67,7 +92,7 @@ public static class SpillIntegrationTests
         //    (ConPTY soft-wraps at window width, inflating the byte
         //    count and making exact-length assertions brittle).
         {
-            await RunWithFreshWorker(async (pipeName, workerPid) =>
+            await RunWithFreshWorker("inline-spill", Assert, async (pipeName, workerPid) =>
             {
                 // 400 × 40-char lines ≈ 16_400 chars — above threshold,
                 // well under any reasonable pty buffer limit, and each
@@ -151,7 +176,7 @@ public static class SpillIntegrationTests
         //    deferred path and the inline path must be observably
         //    equivalent (same preview shape, same spill-file contract).
         {
-            await RunWithFreshWorker(async (pipeName, workerPid) =>
+            await RunWithFreshWorker("cache-spill", Assert, async (pipeName, workerPid) =>
             {
                 // Slow command producing > 15_000 chars AFTER a delay
                 // longer than the timeout. Start-Sleep keeps the
@@ -250,7 +275,7 @@ public static class SpillIntegrationTests
 
             // Inline: big timeout, result comes back in the execute
             // response directly.
-            await RunWithFreshWorker(async (pipeName, _) =>
+            await RunWithFreshWorker("equiv-inline", Assert, async (pipeName, _) =>
             {
                 var resp = await ConsoleWorkerTests.SendRequest(pipeName,
                     w => { w.WriteString("type", "execute"); w.WriteString("command", cmd); w.WriteNumber("timeout", 30000); },
@@ -282,7 +307,7 @@ public static class SpillIntegrationTests
             // Cached: short timeout forces a preemptive flip, then the
             // cached result lands via wait_for_completion. Use sleep
             // before the big output to guarantee a timeout.
-            await RunWithFreshWorker(async (pipeName, _) =>
+            await RunWithFreshWorker("equiv-cached", Assert, async (pipeName, _) =>
             {
                 var slowCmd = "Start-Sleep -Milliseconds 1200; " + cmd;
                 var execResp = await ConsoleWorkerTests.SendRequest(pipeName,
@@ -386,7 +411,7 @@ public static class SpillIntegrationTests
         //    captured stream is already terminal by the time the
         //    snapshot fires. bash exercises the actual settle path.
         {
-            await RunWithFreshWorker(async (pipeName, workerPid) =>
+            await RunWithFreshWorker("trailing", Assert, async (pipeName, workerPid) =>
             {
                 // Body: 400 bulk lines, then the distinctive sentinel.
                 // The bulk drives the output over the 15_000-char
@@ -489,23 +514,79 @@ public static class SpillIntegrationTests
     /// body, and kills the worker on exit. Keeps each integration
     /// scenario isolated so a previous scenario's cache / spill files
     /// can't bleed into the next.
+    ///
+    /// Failure mode contract: launch failures (ProcessLauncher throws)
+    /// and pipe-not-ready timeouts MUST be routed through
+    /// <paramref name="assert"/> so they count toward the surrounding
+    /// <c>Run()</c> fail tally. An earlier version silently returned on
+    /// pipe-not-ready, producing an all-pass report that hid a real
+    /// regression — treating the precondition as a regular assertion
+    /// keeps the tally honest and makes <c>Environment.Exit(1)</c>
+    /// reachable when the fixture itself breaks.
     /// </summary>
-    private static async Task RunWithFreshWorker(Func<string, int, Task> body, string shell = "pwsh.exe")
+    private static Task RunWithFreshWorker(
+        string scenarioName,
+        Action<bool, string> assert,
+        Func<string, int, Task> body,
+        string shell = "pwsh.exe")
+    {
+        return RunWithFreshWorkerCore(scenarioName, assert, body, shell, launchWorker: null);
+    }
+
+    /// <summary>
+    /// Shared implementation for <see cref="RunWithFreshWorker"/>. The
+    /// optional <paramref name="launchWorker"/> override lets the
+    /// pipe-failure self-check inject a deterministic launch failure
+    /// without spawning a real process — the production path passes
+    /// <c>null</c> and uses <see cref="Services.ProcessLauncher"/> as
+    /// normal.
+    /// </summary>
+    private static async Task RunWithFreshWorkerCore(
+        string scenarioName,
+        Action<bool, string> assert,
+        Func<string, int, Task> body,
+        string shell,
+        Func<int>? launchWorker)
     {
         var proxyPid = Environment.ProcessId;
         var agentId = "spill-" + Guid.NewGuid().ToString("N")[..8];
         var cwd = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
-        var launcher = new Services.ProcessLauncher();
-        int workerPid = launcher.LaunchConsoleWorker(proxyPid, agentId, shell, cwd);
+        int workerPid;
+        try
+        {
+            if (launchWorker != null)
+            {
+                workerPid = launchWorker();
+            }
+            else
+            {
+                var launcher = new Services.ProcessLauncher();
+                workerPid = launcher.LaunchConsoleWorker(proxyPid, agentId, shell, cwd);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Route shell-launch failure through the assert delegate so
+            // the surrounding Run() tally records the failure instead of
+            // letting an unhandled exception skip the remaining
+            // scenarios.
+            assert(false, $"{scenarioName}: worker process launched ({ex.GetType().Name}: {ex.Message})");
+            return;
+        }
+
         var pipeName = $"RP.{proxyPid}.{agentId}.{workerPid}";
 
         try
         {
             var ready = await ConsoleWorkerTests.WaitForPipeAsync(pipeName, TimeSpan.FromSeconds(30));
+            assert(ready, $"{scenarioName}: worker pipe became ready");
             if (!ready)
             {
-                Console.Error.WriteLine($"  FAIL: worker pipe did not become ready for {pipeName}");
+                // Skip the body but only AFTER the failure is recorded.
+                // The body may depend on an invariant the pipe wait
+                // establishes, so running it on a dead pipe would just
+                // produce a cascade of misleading false negatives.
                 return;
             }
 

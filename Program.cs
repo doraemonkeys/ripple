@@ -80,6 +80,18 @@ public class Program
             return;
         }
 
+        // --spill-tests: run only the Windows-only spill integration
+        // suite without the surrounding --test / --e2e harness. Lets
+        // the spill path be exercised in isolation (faster feedback
+        // when iterating on OutputTruncationHelper / finalize-window
+        // changes) and keeps the fail-fast contract: any scenario
+        // failure exits the process with code 1.
+        if (args.Contains("--spill-tests"))
+        {
+            await Tests.SpillIntegrationTests.Run();
+            return;
+        }
+
         // --test mode: run tests
         if (args.Contains("--test"))
         {

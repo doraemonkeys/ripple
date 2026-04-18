@@ -596,6 +596,224 @@ public class ConsoleWorkerTests
             _ = idB;
         }
 
+        // CodeRabbit finding #3 — Task.WhenAny race between the timeout
+        // branch and a late-arriving FinalizeSnapshotAsync. The timeout
+        // branch must resolve the race atomically so a real snapshot
+        // that finalize already delivered into the inline TCS never
+        // becomes an orphaned result (neither awaited inline nor
+        // appended to _cachedResults). The fix in HandleExecuteAsync's
+        // TimeoutException handler uses TrySetCanceled under _cacheLock
+        // to cooperate with FinalizeSnapshotAsync's Step 6:
+        //
+        //   - Timeout wins: TrySetCanceled returns true, entry is
+        //     removed, finalize's Step 6 either finds no entry OR
+        //     sees pending.Task.IsCompleted (cancelled) and falls
+        //     through to _cachedResults.
+        //   - Finalize wins: TrySetCanceled returns false (TCS already
+        //     holds a successful result), the timeout branch retrieves
+        //     the real result and returns it via the happy path.
+        //
+        // These two tests pin each leg of the race.
+
+        {
+            // Leg 1: finalize WINS the race. Exercised by driving
+            // finalize first (so it TrySetResult's the inline TCS),
+            // then simulating the timeout branch's post-race logic.
+            // The TrySetCanceled call must return false and the
+            // successful CommandResult must still be reachable via
+            // inlineDelivery.Task.Result so HandleExecuteAsync can
+            // surface it to the caller.
+            var worker = BuildDetachedWorker();
+            var inlineDelivery = new TaskCompletionSource<ConsoleWorker.CommandResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var snapshot = BuildFinalizeTestSnapshot() with { Command = "race-finalize-wins" };
+
+            // Finalize wins the race: TCS is completed with the real result
+            // and its dict entry is removed as part of Step 6.
+            worker.TestRunFinalizeSnapshotAsync(snapshot, inlineDelivery).GetAwaiter().GetResult();
+
+            Assert(inlineDelivery.Task.IsCompletedSuccessfully,
+                "race-finalize-wins: inline TCS holds a successful result");
+            Assert(inlineDelivery.Task.Result.Command == "race-finalize-wins",
+                "race-finalize-wins: inline TCS received the finalized CommandResult");
+            Assert(worker.TestGetInlineDeliveryCount() == 0,
+                "race-finalize-wins: finalize removed its dict entry");
+            Assert(worker.TestGetCachedResultCount() == 0,
+                "race-finalize-wins: nothing cached (inline delivery succeeded)");
+
+            // The timeout branch, on waking up AFTER finalize, calls
+            // TrySetCanceled. Because the TCS already holds a result,
+            // the call must return false — the signal that the fix
+            // uses to redirect into the happy-path serializer instead
+            // of returning a synthetic timeout payload.
+            bool weWonRace = inlineDelivery.TrySetCanceled();
+            Assert(!weWonRace,
+                "race-finalize-wins: TrySetCanceled returns false (finalize already delivered)");
+            Assert(inlineDelivery.Task.IsCompletedSuccessfully,
+                "race-finalize-wins: inline TCS is still CompletedSuccessfully post-TrySetCanceled");
+            Assert(inlineDelivery.Task.Result.Command == "race-finalize-wins",
+                "race-finalize-wins: real result still reachable via Task.Result");
+        }
+
+        {
+            // Leg 2: timeout WINS the race. The timeout branch cancels
+            // the inline TCS and removes it from the dict. A late
+            // finalize arriving after that cancellation must fall
+            // through to _cachedResults so wait_for_completion drains
+            // the real result (and never returns `no_cache`).
+            //
+            // This test registers a TCS under an id, pre-cancels it
+            // (simulating the Option B inside-the-lock step), leaves
+            // the dict entry intact (simulating the pathological case
+            // where the timeout branch hadn't yet removed it —
+            // Step 6's completed-task guard is the safety net), then
+            // drives finalize with a snapshot carrying that id. Step 6
+            // must observe the cancelled TCS and route the result into
+            // _cachedResults instead of calling TrySetResult on the
+            // cancelled slot.
+            var worker = BuildDetachedWorker();
+            var preCancelled = new TaskCompletionSource<ConsoleWorker.CommandResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var id = worker.TestRegisterInlineDelivery(preCancelled);
+            Assert(preCancelled.TrySetCanceled(),
+                "race-timeout-wins: precondition — we own the cancellation");
+
+            // Rebuild a snapshot that carries the same inline-delivery
+            // id so finalize's id-routing lookup hits the cancelled
+            // slot. TestRunFinalizeSnapshotAsync with inlineDelivery:null
+            // preserves the snapshot's InlineDeliveryId verbatim.
+            var snapshot = BuildFinalizeTestSnapshot() with
+            {
+                Command = "race-timeout-wins",
+                InlineDeliveryId = id,
+            };
+            worker.TestRunFinalizeSnapshotAsync(snapshot, inlineDelivery: null)
+                .GetAwaiter().GetResult();
+
+            Assert(worker.TestGetCachedResultCount() == 1,
+                "race-timeout-wins: finalize appended result to _cachedResults (cancelled TCS bypassed)");
+            var drain = worker.TestDrainCachedOutput();
+            Assert(drain.TryGetProperty(WireStatusField, out var st) && st.GetString() == WireStatusOk,
+                "race-timeout-wins: drain returns status == ok (result reachable via wait_for_completion)");
+            var entry = drain.GetProperty(WireResultsField)[0];
+            var cmd = entry.TryGetProperty("command", out var cp) ? cp.GetString() : null;
+            Assert(cmd == "race-timeout-wins",
+                $"race-timeout-wins: drained entry carries the finalized command (got: {cmd})");
+        }
+
+        // Codex Review follow-up — Finding A: when finalize loses the
+        // Task.WhenAny race (timeout branch wakes first) but beats the
+        // timeout branch's TrySetCanceled into the inline TCS with a
+        // TrySetException, the timeout branch's fallthrough path used
+        // to synthesize `timedOut:true` instead of surfacing finalize's
+        // exception. The fix dispatches on the TCS's terminal state
+        // after TrySetCanceled returns false: IsFaulted ⇒ emit a
+        // `"finalize failed: <Type>: <message>"` response (no
+        // timedOut flag) so the client sees the real failure, not a
+        // misleading timeout.
+        //
+        // These two tests pin each terminal-state leg:
+        //   - race-finalize-fails: TCS is faulted, response carries
+        //     "finalize failed:" and NOT timedOut:true.
+        //   - race-finalize-success-fields: TCS holds a successful
+        //     CommandResult, response carries the same keys as the
+        //     normal happy path (structural equivalence).
+        {
+            // race-finalize-fails: simulate finalize landing a
+            // TrySetException on the inline TCS before the timeout
+            // branch's TrySetCanceled could fire. Feed the resulting
+            // faulted TCS into the race-loss dispatch seam and verify
+            // the caller sees "finalize failed:" with NO timedOut flag.
+            var worker = BuildDetachedWorker();
+            var inlineDelivery = new TaskCompletionSource<ConsoleWorker.CommandResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var thrown = new InvalidOperationException("synthetic finalize failure");
+            inlineDelivery.SetException(thrown);
+
+            // TrySetCanceled returns false because the TCS is already
+            // faulted — this is the exact state HandleExecuteAsync's
+            // race branch enters the !weWonRace arm in.
+            Assert(!inlineDelivery.TrySetCanceled(),
+                "race-finalize-fails: precondition — TrySetCanceled returns false on faulted TCS");
+
+            var response = worker.TestResolveTimeoutRaceLossAsync(inlineDelivery)
+                .GetAwaiter().GetResult();
+            Assert(response.HasValue,
+                "race-finalize-fails: dispatcher returned a response (did not fall through to synthetic timeout)");
+
+            var r = response!.Value;
+            var hasTimedOut = r.TryGetProperty("timedOut", out var toProp) && toProp.GetBoolean();
+            Assert(!hasTimedOut,
+                "race-finalize-fails: response does NOT carry timedOut:true");
+            var outputStr = r.TryGetProperty(WireOutputField, out var op) ? op.GetString() ?? "" : "";
+            Assert(outputStr.StartsWith("finalize failed:"),
+                $"race-finalize-fails: Output begins with 'finalize failed:' (got: {outputStr})");
+            Assert(outputStr.Contains(nameof(InvalidOperationException)),
+                "race-finalize-fails: Output carries the throwing exception type");
+            Assert(outputStr.Contains("synthetic finalize failure"),
+                "race-finalize-fails: Output carries the original exception message");
+            Assert(r.TryGetProperty("exitCode", out var ec) && ec.GetInt32() == -1,
+                "race-finalize-fails: exitCode == -1 (matches normal inline-await failure shape)");
+        }
+
+        {
+            // race-finalize-success-fields: simulate finalize landing a
+            // successful CommandResult on the inline TCS before the
+            // timeout branch's TrySetCanceled could fire. Feed the TCS
+            // into the race-loss dispatch seam and verify the response
+            // has the SAME keys as the normal happy path — the Case 1
+            // fix routes both arms through BuildExecuteSuccessResponseAsync
+            // so `_currentMode` / `_currentModeLevel` emission (when
+            // adapter has modes) and `spillFilePath` emission (when set)
+            // stay identical.
+            var worker = BuildDetachedWorker();
+            var inlineDelivery = new TaskCompletionSource<ConsoleWorker.CommandResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var delivered = new ConsoleWorker.CommandResult(
+                Output: "hello world\n",
+                ExitCode: 0,
+                Cwd: @"C:\fake-cwd",
+                Command: "race-finalize-success-fields",
+                Duration: "1.2",
+                StatusLine: "#fake-title  [0] 1.2s  C:\\fake-cwd",
+                SpillFilePath: null);
+            inlineDelivery.SetResult(delivered);
+            Assert(!inlineDelivery.TrySetCanceled(),
+                "race-finalize-success-fields: precondition — TrySetCanceled returns false on completed TCS");
+
+            var response = worker.TestResolveTimeoutRaceLossAsync(inlineDelivery)
+                .GetAwaiter().GetResult();
+            Assert(response.HasValue,
+                "race-finalize-success-fields: dispatcher returned a response (not fall-through)");
+
+            var r = response!.Value;
+            // Structural equivalence with the normal success arm: the
+            // detached worker has no adapter (so no modes and no mode
+            // fields), and SpillFilePath is null (so no spillFilePath
+            // field). Verify the exact key set the happy path would
+            // emit under the same conditions.
+            var keys = new List<string>();
+            foreach (var prop in r.EnumerateObject()) keys.Add(prop.Name);
+            var expectedKeys = new[] { WireOutputField, "exitCode", "cwd", "duration", "timedOut" };
+            foreach (var k in expectedKeys)
+                Assert(keys.Contains(k), $"race-finalize-success-fields: response carries '{k}'");
+            Assert(!keys.Contains("spillFilePath"),
+                "race-finalize-success-fields: no spillFilePath key when CommandResult.SpillFilePath is null");
+            Assert(!keys.Contains("currentMode"),
+                "race-finalize-success-fields: no currentMode key when adapter has no modes");
+
+            Assert(r.GetProperty(WireOutputField).GetString() == delivered.Output,
+                "race-finalize-success-fields: output verbatim from the delivered CommandResult");
+            Assert(r.GetProperty("exitCode").GetInt32() == delivered.ExitCode,
+                "race-finalize-success-fields: exitCode verbatim from the delivered CommandResult");
+            Assert(r.GetProperty("cwd").GetString() == delivered.Cwd,
+                "race-finalize-success-fields: cwd verbatim from the delivered CommandResult");
+            Assert(r.GetProperty("duration").GetString() == delivered.Duration,
+                "race-finalize-success-fields: duration verbatim from the delivered CommandResult");
+            Assert(!r.GetProperty("timedOut").GetBoolean(),
+                "race-finalize-success-fields: timedOut:false (not a timeout)");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }

@@ -281,6 +281,87 @@ public static class OutputTruncationHelperTests
             Assert(!threw, "cleanup-empty: no throw when directory missing");
         }
 
+        // Unix-only: spill files land at 0600 and the spill directory at
+        // 0700 so a co-tenant on /tmp can't read our command output.
+        // Skipped on Windows, where %TEMP% is per-user and ACL-protected
+        // by default. Uses the real DefaultFileSystem via the
+        // parameterless constructor (with a helper-owned directory under
+        // the platform temp root) so this exercises production code, not
+        // the in-memory fake.
+        if (!OperatingSystem.IsWindows())
+        {
+            // Isolate into a throwaway subdirectory so parallel runs and
+            // leftover state from other tests can't pollute the assertions.
+            var testDir = Path.Combine(
+                Path.GetTempPath(),
+                "ripple.output.test." + Guid.NewGuid().ToString("N"));
+
+            try
+            {
+                var helper = new OutputTruncationHelper(
+                    DefaultFileSystem.Instance,
+                    new FakeClock(DateTimeOffset.UtcNow),
+                    testDir);
+
+                var input = new string('u', 20_000);
+                var result = helper.Process(input);
+
+                Assert(result.SpillFilePath != null,
+                    "unix-perms: spill file was created");
+
+                if (result.SpillFilePath != null)
+                {
+                    var fileMode = File.GetUnixFileMode(result.SpillFilePath);
+                    Assert(
+                        fileMode == (UnixFileMode.UserRead | UnixFileMode.UserWrite),
+                        $"unix-perms: spill file is 0600 (got {fileMode})");
+                }
+
+                var dirMode = File.GetUnixFileMode(testDir);
+                Assert(
+                    dirMode == (UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute),
+                    $"unix-perms: spill directory is 0700 (got {dirMode})");
+
+                // A pre-existing, over-permissive directory gets tightened
+                // on next CreateDirectory. Simulates a legacy install or
+                // a user who accidentally chmod 755'd the dir.
+                var legacyDir = Path.Combine(
+                    Path.GetTempPath(),
+                    "ripple.output.legacy." + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(legacyDir);
+                File.SetUnixFileMode(legacyDir,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                    UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                    UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+
+                try
+                {
+                    var helper2 = new OutputTruncationHelper(
+                        DefaultFileSystem.Instance,
+                        new FakeClock(DateTimeOffset.UtcNow),
+                        legacyDir);
+
+                    var result2 = helper2.Process(new string('v', 20_000));
+                    var tightenedMode = File.GetUnixFileMode(legacyDir);
+                    Assert(
+                        tightenedMode == (UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute),
+                        $"unix-perms: pre-existing 0755 directory tightened to 0700 (got {tightenedMode})");
+                }
+                finally
+                {
+                    try { Directory.Delete(legacyDir, recursive: true); } catch { }
+                }
+            }
+            finally
+            {
+                try { Directory.Delete(testDir, recursive: true); } catch { }
+            }
+        }
+        else
+        {
+            Console.WriteLine("  SKIP: unix-perms (Windows host — %TEMP% is per-user)");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
