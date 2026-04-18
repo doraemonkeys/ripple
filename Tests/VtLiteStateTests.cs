@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Text;
 using Ripple.Services;
 
 namespace Ripple.Tests;
@@ -341,5 +343,69 @@ public class VtLiteStateTests
 
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
+
+        // --- Perf bench (not a pass/fail test; prints throughput so the
+        // memo's "Expected overhead: negligible (<5%) but measure on
+        // large outputs (1 MB+) before merging" claim has a concrete
+        // number attached). Runs after the assertion summary so a bad
+        // number doesn't flip a green test run red, but still surfaces
+        // in CI / HANDOFF.
+        RunFeedBenchmark();
+    }
+
+    /// <summary>
+    /// Feeds ~1 MB of synthetic PTY-like output (printable + CSI cursor
+    /// moves + SGR runs) through Feed() in 4096-char chunks and reports
+    /// elapsed time + throughput. Used to sanity-check the allocation-
+    /// minimal refactor's overhead claim before shipping Phase 1 on
+    /// hot-loop platforms.
+    /// </summary>
+    private static void RunFeedBenchmark()
+    {
+        const int TargetBytes = 1 * 1024 * 1024; // 1 MiB
+        const int ChunkSize = 4096;
+
+        // Build a representative input pattern repeating a 256-char
+        // template that exercises the Feed hot path: SGR (no-op for
+        // cursor), short run of printable, cursor-position CSI, more
+        // printable, erase-line CSI. Dominated by printable chars the
+        // way real shell output is.
+        var template = new StringBuilder();
+        for (int i = 0; i < 8; i++)
+        {
+            template.Append("\x1b[38;5;")
+                    .Append(31 + i)
+                    .Append('m')
+                    .Append("abcdefghijklmnop")
+                    .Append("\x1b[0m");
+            template.Append("\x1b[2;")
+                    .Append((i * 13) % 80 + 1)
+                    .Append('H');
+            template.Append("qrstuvwxyzQRSTUVWXYZ ");
+            template.Append("\x1b[K");
+        }
+        var templateStr = template.ToString();
+        var sb = new StringBuilder(TargetBytes + templateStr.Length);
+        while (sb.Length < TargetBytes) sb.Append(templateStr);
+        var payload = sb.ToString();
+
+        // Fresh VtLiteState, 30×120 — the default production viewport.
+        var state = new VtLiteState(30, 120);
+
+        // Warm-up pass so JIT / AOT tiering settles before measurement.
+        for (int off = 0; off + ChunkSize <= payload.Length; off += ChunkSize)
+            state.Feed(payload.AsSpan(off, ChunkSize));
+
+        state = new VtLiteState(30, 120);
+        var sw = Stopwatch.StartNew();
+        for (int off = 0; off + ChunkSize <= payload.Length; off += ChunkSize)
+            state.Feed(payload.AsSpan(off, ChunkSize));
+        sw.Stop();
+
+        double mib = payload.Length / 1024.0 / 1024.0;
+        double mibPerSec = mib / sw.Elapsed.TotalSeconds;
+        Console.WriteLine(
+            $"  BENCH VtLiteState.Feed: {mib:F2} MiB in {sw.Elapsed.TotalMilliseconds:F1} ms " +
+            $"({mibPerSec:F0} MiB/s)");
     }
 }
