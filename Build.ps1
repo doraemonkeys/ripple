@@ -32,6 +32,17 @@ if ($processes.Count -gt 0) {
 }
 
 Write-Host "`n[2/3] Publishing (Release, NativeAOT)..." -ForegroundColor Yellow
+# NativeAOT's ILCompiler targets invoke vswhere.exe to locate MSVC link.exe;
+# vswhere lives at a stable Program Files location but isn't on PATH for
+# plain pwsh sessions (only Developer PowerShell adds it). Prepend the
+# installer dir ourselves when the caller hasn't so `.\Build.ps1` works
+# from any shell on a box with VS installed, not only from a VS-opened
+# prompt. No-op when vswhere is already resolvable.
+$vswhereDir = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer'
+if (-not (Get-Command vswhere.exe -ErrorAction Ignore) -and
+    (Test-Path (Join-Path $vswhereDir 'vswhere.exe') -PathType Leaf)) {
+    $env:PATH = "$vswhereDir;$env:PATH"
+}
 dotnet publish $ProjectFile -c Release -r win-x64 -o $DistDir
 if ($LASTEXITCODE -ne 0) { throw "Publish failed" }
 
