@@ -2002,17 +2002,15 @@ public class ConsoleWorker
 
                     var text = Encoding.UTF8.GetString(buffer, 0, read);
                     // Advance the live VT-100 interpreter with the raw
-                    // chunk BEFORE stripping DSR queries, on Unix only.
-                    // Feeding raw is safe: DSR's final byte ('n') is a
-                    // no-op in ApplyCsi, so the cursor isn't perturbed
-                    // by the query itself. Windows is gated out because
-                    // ConPTY intercepts DSR before ripple sees it (so
-                    // the live cursor is dead code there) and the
-                    // per-byte CSI parsing was observed to introduce
-                    // intermittent timing jitter on the deno
-                    // adapter-tests sequence.
-                    if (!OperatingSystem.IsWindows())
-                        _vtState.Feed(text.AsSpan());
+                    // chunk BEFORE stripping DSR queries. Feeding raw is
+                    // safe: DSR's final byte ('n') is a no-op in
+                    // ApplyCsi, so the cursor isn't perturbed by the
+                    // query itself. Runs on every platform so the peek
+                    // path and any other readers can share one
+                    // authoritative cursor. Hot path is span-based and
+                    // allocation-free — the earlier Windows-only gate
+                    // was needed before VtLiteState.Feed was refactored.
+                    _vtState.Feed(text.AsSpan());
                     text = AnswerAndStripTerminalQueries(text);
                     if (_tracker.Busy) Log($"RAW: {EscapeForLog(text)}");
                     var result = _parser.Parse(text);

@@ -322,15 +322,46 @@ public sealed class VtLiteState
     /// stitched to the next call so a CSI / OSC split across two PTY
     /// reads still produces correct cursor state. Safe to call with an
     /// empty span as a no-op.
+    ///
+    /// Hot path (no pending escape held) processes the span directly —
+    /// no per-chunk string allocation. Cold path (pending held) merges
+    /// pending + input into a rented char[] from ArrayPool or a
+    /// stack-allocated buffer for short sequences, to avoid GC pressure
+    /// on the read loop.
     /// </summary>
     public void Feed(ReadOnlySpan<char> input)
     {
-        string text;
         if (_pending.Length > 0)
         {
-            _pending.Append(input);
-            text = _pending.ToString();
-            _pending.Clear();
+            int combinedLen = _pending.Length + input.Length;
+            // Stackalloc / rent branches are kept separate so the stack-
+            // allocated Span stays in its declaration scope — C#'s ref-
+            // safety rules reject hoisting it out past the branch.
+            if (combinedLen <= 512)
+            {
+                Span<char> stackBuf = stackalloc char[512];
+                Span<char> combined = stackBuf.Slice(0, combinedLen);
+                _pending.CopyTo(0, combined, _pending.Length);
+                input.CopyTo(combined.Slice(_pending.Length));
+                _pending.Clear();
+                FeedSpan(combined);
+            }
+            else
+            {
+                var rented = System.Buffers.ArrayPool<char>.Shared.Rent(combinedLen);
+                try
+                {
+                    Span<char> combined = rented.AsSpan(0, combinedLen);
+                    _pending.CopyTo(0, combined, _pending.Length);
+                    input.CopyTo(combined.Slice(_pending.Length));
+                    _pending.Clear();
+                    FeedSpan(combined);
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<char>.Shared.Return(rented);
+                }
+            }
         }
         else if (input.Length == 0)
         {
@@ -338,9 +369,18 @@ public sealed class VtLiteState
         }
         else
         {
-            text = new string(input);
+            FeedSpan(input);
         }
+    }
 
+    /// <summary>
+    /// Internal driver — processes a complete ReadOnlySpan directly
+    /// (no pending merge, no allocation). On an incomplete escape, the
+    /// tail is appended to <see cref="_pending"/> for the next <see
+    /// cref="Feed"/> call.
+    /// </summary>
+    private void FeedSpan(ReadOnlySpan<char> text)
+    {
         int i = 0;
         while (i < text.Length)
         {
@@ -354,10 +394,9 @@ public sealed class VtLiteState
                 int next = ParseEscape(text, i, this);
                 if (next < 0)
                 {
-                    // Incomplete escape — buffer the tail for the next feed.
                     int tailLen = text.Length - i;
                     if (tailLen <= PendingMaxChars)
-                        _pending.Append(text, i, tailLen);
+                        _pending.Append(text.Slice(i, tailLen));
                     // else: runaway sequence, drop and keep cursor sane.
                     return;
                 }
@@ -421,7 +460,7 @@ public sealed class VtLiteState
     /// streaming caller buffers the tail for the next feed; the one-shot
     /// caller treats -1 as "drop the rest".
     /// </summary>
-    private static int ParseEscape(string input, int start, VtLiteState state)
+    private static int ParseEscape(ReadOnlySpan<char> input, int start, VtLiteState state)
     {
         int i = start + 1;
         if (i >= input.Length) return -1; // bare ESC at boundary
@@ -433,11 +472,13 @@ public sealed class VtLiteState
             int paramStart = i + 1;
             int j = paramStart;
             while (j < input.Length && input[j] >= 0x30 && input[j] <= 0x3f) j++;
-            var paramsStr = j > paramStart ? input.Substring(paramStart, j - paramStart) : "";
+            var paramsSpan = j > paramStart
+                ? input.Slice(paramStart, j - paramStart)
+                : ReadOnlySpan<char>.Empty;
             while (j < input.Length && input[j] >= 0x20 && input[j] <= 0x2f) j++;
             if (j >= input.Length) return -1; // CSI without final byte
             char final = input[j];
-            ApplyCsi(paramsStr, final, state);
+            ApplyCsi(paramsSpan, final, state);
             return j + 1;
         }
         if (next == ']')
@@ -473,14 +514,43 @@ public sealed class VtLiteState
         return i + 1;
     }
 
-    private static void ApplyCsi(string paramsStr, char final, VtLiteState state)
+    /// <summary>
+    /// Extract the N-th semicolon-separated numeric parameter from a CSI
+    /// params span, returning <paramref name="def"/> for missing / empty
+    /// slots or parse failures. Avoids the string[] allocation of
+    /// paramsStr.Split(';') on the hot path.
+    /// </summary>
+    private static int GetParam(ReadOnlySpan<char> paramsSpan, int idx, int def)
+    {
+        int count = 0;
+        int start = 0;
+        for (int k = 0; k <= paramsSpan.Length; k++)
+        {
+            if (k == paramsSpan.Length || paramsSpan[k] == ';')
+            {
+                if (count == idx)
+                {
+                    int len = k - start;
+                    if (len == 0) return def;
+                    return int.TryParse(paramsSpan.Slice(start, len), out var n) ? n : def;
+                }
+                count++;
+                start = k + 1;
+            }
+        }
+        return def;
+    }
+
+    private static void ApplyCsi(ReadOnlySpan<char> paramsSpan, char final, VtLiteState state)
     {
         // Private-mode sequences (DEC — \e[?...h / \e[?...l).
-        if (paramsStr.Length > 0 && paramsStr[0] == '?')
+        if (paramsSpan.Length > 0 && paramsSpan[0] == '?')
         {
             // Only handle alternate screen buffer toggle.
-            var modeStr = paramsStr.Substring(1);
-            if (modeStr == "1049" || modeStr == "1047" || modeStr == "47")
+            var modeSpan = paramsSpan.Slice(1);
+            if (modeSpan.SequenceEqual("1049".AsSpan())
+                || modeSpan.SequenceEqual("1047".AsSpan())
+                || modeSpan.SequenceEqual("47".AsSpan()))
             {
                 if (final == 'h') state.SwitchToAlternate();
                 else if (final == 'l') state.SwitchToPrimary();
@@ -488,40 +558,27 @@ public sealed class VtLiteState
             return;
         }
 
-        // Parse semicolon-separated numeric params. Empty == default.
-        string[] parts;
-        if (paramsStr.Length == 0) parts = Array.Empty<string>();
-        else parts = paramsStr.Split(';');
-
-        int Param(int idx, int def)
-        {
-            if (idx >= parts.Length) return def;
-            if (string.IsNullOrEmpty(parts[idx])) return def;
-            if (int.TryParse(parts[idx], out var n)) return n;
-            return def;
-        }
-
         switch (final)
         {
-            case 'A': state.CursorUp(Param(0, 1)); break;         // CUU
-            case 'B': state.CursorDown(Param(0, 1)); break;       // CUD
-            case 'C': state.CursorForward(Param(0, 1)); break;    // CUF
-            case 'D': state.CursorBack(Param(0, 1)); break;       // CUB
-            case 'E': state.CursorDown(Param(0, 1)); state.Col = 0; break; // CNL
-            case 'F': state.CursorUp(Param(0, 1)); state.Col = 0; break;   // CPL
-            case 'G': state.CursorCol(Param(0, 1)); break;        // CHA
-            case 'H':                                              // CUP
-            case 'f':                                              // HVP
-                state.CursorPos(Param(0, 1), Param(1, 1));
+            case 'A': state.CursorUp(GetParam(paramsSpan, 0, 1)); break;         // CUU
+            case 'B': state.CursorDown(GetParam(paramsSpan, 0, 1)); break;       // CUD
+            case 'C': state.CursorForward(GetParam(paramsSpan, 0, 1)); break;    // CUF
+            case 'D': state.CursorBack(GetParam(paramsSpan, 0, 1)); break;       // CUB
+            case 'E': state.CursorDown(GetParam(paramsSpan, 0, 1)); state.Col = 0; break; // CNL
+            case 'F': state.CursorUp(GetParam(paramsSpan, 0, 1)); state.Col = 0; break;   // CPL
+            case 'G': state.CursorCol(GetParam(paramsSpan, 0, 1)); break;        // CHA
+            case 'H':                                                             // CUP
+            case 'f':                                                             // HVP
+                state.CursorPos(GetParam(paramsSpan, 0, 1), GetParam(paramsSpan, 1, 1));
                 break;
-            case 'K': state.EraseLine(Param(0, 0)); break;        // EL
-            case 'J': state.EraseDisplay(Param(0, 0)); break;     // ED
-            case 'X': state.EraseChars(Param(0, 1)); break;       // ECH
-            case 'P': state.DeleteChars(Param(0, 1)); break;      // DCH
-            case '@': state.InsertChars(Param(0, 1)); break;      // ICH
-            case 'L': state.InsertLines(Param(0, 1)); break;      // IL
-            case 'M': state.DeleteLines(Param(0, 1)); break;      // DL
-            case 'd': state.Row = Math.Clamp(Param(0, 1) - 1, 0, state.ViewRows - 1); break; // VPA
+            case 'K': state.EraseLine(GetParam(paramsSpan, 0, 0)); break;        // EL
+            case 'J': state.EraseDisplay(GetParam(paramsSpan, 0, 0)); break;     // ED
+            case 'X': state.EraseChars(GetParam(paramsSpan, 0, 1)); break;       // ECH
+            case 'P': state.DeleteChars(GetParam(paramsSpan, 0, 1)); break;      // DCH
+            case '@': state.InsertChars(GetParam(paramsSpan, 0, 1)); break;      // ICH
+            case 'L': state.InsertLines(GetParam(paramsSpan, 0, 1)); break;      // IL
+            case 'M': state.DeleteLines(GetParam(paramsSpan, 0, 1)); break;      // DL
+            case 'd': state.Row = Math.Clamp(GetParam(paramsSpan, 0, 1) - 1, 0, state.ViewRows - 1); break; // VPA
             case 't':
                 // DEC / xterm window manipulation — e.g. \e[8;<h>;<w>t to
                 // resize the text area. ConPTY emits this as the prelude
@@ -536,7 +593,7 @@ public sealed class VtLiteState
             case 's': state.SaveCursor(); break;
             case 'u': state.RestoreCursor(); break;
             case 'r': // DECSTBM — scroll region
-                state.SetScrollRegion(Param(0, 1), Param(1, state.ViewRows));
+                state.SetScrollRegion(GetParam(paramsSpan, 0, 1), GetParam(paramsSpan, 1, state.ViewRows));
                 break;
             case 'm': // SGR — colors/attrs, no-op
             case 'n': // device status report
