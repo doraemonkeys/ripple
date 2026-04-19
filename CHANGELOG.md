@@ -2,9 +2,9 @@
 
 All notable changes to ripple are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [Semantic Versioning](https://semver.org/).
 
-## [0.10.0] - 2026-04-19
+## [0.10.0] - 2026-04-20
 
-Two parallel rounds land in the same release. **(1) Live virtual-
+Three parallel rounds land in the same release. **(1) Live virtual-
 terminal cursor tracking** — ripple now keeps an authoritative
 VT-100 interpreter advanced from every PTY chunk and answers DSR
 (`\x1b[6n`) cursor-position queries from real state instead of the
@@ -20,7 +20,18 @@ worker-owned spill file (`%TEMP%\ripple.output\` on Windows,
 returns a head + tail preview embedding the spill path. Inline
 `execute_command` and deferred `wait_for_completion` now flow
 through a shared finalize-once boundary so both delivery modes
-return the same `CommandResult` shape.
+return the same `CommandResult` shape. **(3) Command-output
+extraction is rebuilt as a per-command fork of the live VT
+interpreter** (closes #4) — at OSC C the worker snapshots the
+session-wide `_vtState` and hands the snapshot to a new
+`CommandOutputRenderer` initialised from it. ConPTY's
+post-alt-screen and post-prompt redraw bursts target cells whose
+baseline values match what's being rewritten, so a per-cell change
+detector recognises them as idempotent overwrites and they stay
+out of the AI-facing MCP response. Alt-screen entry/exit collapses
+to an `[interactive screen session]` placeholder; soft-wrapped
+logical lines are re-joined at render time so a narrow PTY can't
+fragment a single `git log --oneline` entry.
 
 ### Added
 - **`Services/VtLiteState.cs`** — the VT-100 interpreter formerly
@@ -170,6 +181,117 @@ return the same `CommandResult` shape.
   (color) is still kept verbatim. The visible-terminal mirror is
   untouched — the human still sees a live progress bar exactly as
   the shell intended; only the AI-facing `output` collapses.
+
+### Renderer overhaul (round 3 — closes #4)
+
+#### Added
+
+- **`Services/CommandOutputRenderer.cs`** — cell-based per-command
+  fork of the live `VtLiteState`. Constructor accepts an optional
+  `VtLiteSnapshot` baseline; rows are pre-populated from the
+  snapshot grid, cursor / saved-cursor / scroll-region / SGR /
+  alt-screen state carry over, and each baseline row stashes a
+  `BaselineCells` immutable copy for the per-cell change detector
+  at `Render` time. Implements CUU/CUD/CUF/CUB/CNL/CPL/CHA/VPA,
+  CUP/HVP, EL/ED, ECH, DCH/ICH, IL/DL, save/restore, real
+  alt-screen save/restore semantics, and viewport-top tracking
+  that increments on LFs crossing the snapshot's viewport bottom
+  so subsequent CUP coordinates land on the rows ConPTY actually
+  intends.
+- **`VtLiteState.Snapshot()` + per-row soft-wrap + active-SGR
+  tracking.** New `VtLiteSnapshot` deep-copy record carries
+  primary + alternate grids, soft-wrap flags, cursor, saved
+  cursor, scroll region, alt-screen flag, and the active SGR
+  carry-over. `WriteChar`'s auto-wrap now flips a per-row
+  "continued from above" flag (set on wrap, cleared on hard LF /
+  EraseLine mode 2 / EraseDisplay; shifted in lockstep with grid
+  rows on `ScrollUp` / `ScrollDown`). `RecordSgr` accumulates
+  non-reset SGR sequences since the last `\e[m` / `\e[0m` /
+  leading-0 compound reset so the snapshot's `ActiveSgr` can seed
+  the renderer's first-cell prefix.
+- **`CompletedCommandSnapshot.VtBaseline`** — optional snapshot
+  field threaded through `CommandTracker` ↔ `ConsoleWorker` ↔
+  `CommandOutputFinalizer.Clean`. The worker snapshots
+  `_vtState` (session-wide, not the tracker's per-OSC-C-reset
+  one) right before forwarding the OSC C event so the renderer
+  receives the screen state ConPTY has at command start.
+- **Soft-wrap re-joining at render time.** Rows whose
+  `ContinuedFromAbove` flag is set are appended to the previous
+  emitted line without an inter-row newline, so a long `git log
+  --oneline` entry that auto-wrapped at the PTY's right margin
+  reaches the AI as one logical line.
+- **Alt-screen as placeholder.** Entry switches to a separate row
+  list for alt-buffer writes; exit restores the main-buffer
+  cursor and inserts a single `[interactive screen session]` line
+  in the rendered output. ConPTY's post-exit redraw of the saved
+  main buffer is naturally absorbed by the per-cell baseline diff
+  (cells already hold the expected values).
+- **Regex-prompt cap.** `RegexPromptDetector.Scan` returns
+  `(Start, End)` per match (was end-only). Worker fires synthetic
+  `CommandFinished` + `PromptStart` at `Start` so the visible
+  prompt characters are excluded from the
+  `[commandStart, OSC A]` window — fixes trailing `(Pdb)` /
+  `DB<N>` / `>` leak for pdb / perldb / python / and any other
+  regex-prompt REPL. `Start` also backs past contiguous non-reset
+  SGR sequences immediately preceding the prompt match (REPL
+  prompt decoration), bounded at any reset SGR (the prior
+  command's "stop coloring" closer) and at any non-SGR byte
+  including whitespace.
+- **23 new tests** covering snapshot independence, soft-wrap
+  flags, SGR set/reset/compound, baseline-skip-pre-command,
+  ConPTY-repaint-idempotent, alt-screen+baseline placeholder,
+  soft-wrap re-join, regex-prompt Start vs End semantics,
+  prompt-decoration SGR back-up, and reset-SGR halt. All 728
+  tests pass.
+
+#### Changed
+
+- **Bare `\r` is now cursor-reset only (no row clear).** Matches
+  what the human sees in the live terminal — verified
+  empirically against Git Bash via ripple MCP. The legacy
+  "clear the row on bare CR" is intentionally lossier than
+  terminal spec; with the cell-based renderer in place, the spec
+  semantics produce identical results for properly-formed
+  progress bars (which use `\r\x1b[K` or full-replacement
+  rewrites) and slightly truthier results for short rewrites
+  (which match the live-terminal residue).
+- **Node.js integration script (`integration.js`) emits OSC bytes
+  BEFORE the visible prompt** instead of after. Same pattern
+  pwsh's prompt function has always used. Eliminates the trailing
+  `> ` on every node REPL command. OSC sequences are zero-width
+  so emitting them at any cursor position is safe; the previous
+  "after" ordering was conservative but unnecessary.
+
+#### Fixed
+
+- **Issue #4 — `echo … | grep` on Git Bash via ConPTY no longer
+  drops trailing match lines.** ConPTY emits a screen-redraw
+  burst around prompts that contains real grep output
+  (`cherry`, `elderberry`) and absolute cursor positioning the
+  legacy `StripAnsi` silently dropped, leaving only the first
+  match (`banana`) in the cleaned output. The new renderer
+  processes the cursor positioning correctly and the per-cell
+  baseline diff treats matching repaint as idempotent — all
+  three matches survive intact.
+- **Trailing `\e[m` reset SGR is no longer lost** when the
+  output ends with `text\r\n\e[m`. `Render` flushes pending SGR
+  to the last non-empty row's `TrailingSgr` before iterating
+  rows, so end-of-output color resets reach downstream consumers
+  instead of leaving "color stuck on" state.
+
+#### Known limitation
+
+- **First alt-screen run on a fresh console after one or more
+  prior non-alt commands** may include ConPTY's post-exit redraw
+  of the visible session history in the MCP response (typically
+  3–6 prior prompts). Subsequent alt-screen runs in the same
+  console produce clean output. Cause: a subtle divergence
+  between `ConsoleWorker._vtState`'s incremental session state
+  and ConPTY's screen view; the first ConPTY full redraw syncs
+  them. Fix deferred to a follow-up PR; mitigation is to either
+  ignore the first noisy response or to discard one warm-up
+  command. Affects only alt-screen workflows (vim, less, htop)
+  on the very first such command of a session.
 
 ## [0.8.0] - 2026-04-16
 
