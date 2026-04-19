@@ -4,17 +4,23 @@ All notable changes to ripple are documented here. Format based on [Keep a Chang
 
 ## [0.10.0] - 2026-04-19
 
-Live virtual-terminal cursor tracking lands. ripple now keeps an
-authoritative VT-100 interpreter advanced from every PTY chunk and
-answers DSR (`\x1b[6n`) cursor-position queries from real state
-instead of the static "near the bottom of the screen" + prompt-
-heuristic column it shipped with. Closes the long-standing Unix
-drift where PSReadLine's up-arrow history recall painted over the
-active prompt, and bash readline wrapped long input lines into the
-wrong column, after a few AI commands' worth of output had
-scrolled past. The peek_console snapshot path is rewired to share
-the same authoritative state, and the Feed hot path is allocation-
-free so live tracking runs on every platform — not just Unix.
+Two parallel rounds land in the same release. **(1) Live virtual-
+terminal cursor tracking** — ripple now keeps an authoritative
+VT-100 interpreter advanced from every PTY chunk and answers DSR
+(`\x1b[6n`) cursor-position queries from real state instead of the
+static "near the bottom of the screen" + prompt-heuristic column
+it shipped with. Closes the long-standing Unix drift where
+PSReadLine's up-arrow history recall painted over the active
+prompt, and bash readline wrapped long input lines into the wrong
+column, after a few AI commands' worth of output had scrolled
+past. **(2) Oversized command output is spilled to a temp file**
+(closes #1, PR #5) — outputs over `15,000` chars are written to a
+worker-owned spill file (`%TEMP%\ripple.output\` on Windows,
+`${TMPDIR:-/tmp}/ripple.output/` on Unix) and the MCP response
+returns a head + tail preview embedding the spill path. Inline
+`execute_command` and deferred `wait_for_completion` now flow
+through a shared finalize-once boundary so both delivery modes
+return the same `CommandResult` shape.
 
 ### Added
 - **`Services/VtLiteState.cs`** — the VT-100 interpreter formerly
@@ -36,6 +42,28 @@ free so live tracking runs on every platform — not just Unix.
   detected DSR (was one reply per chunk regardless of count) and
   strips the partial prefix from output so it never leaks
   downstream into `OscParser` / mirror / AI-visible bytes.
+- **`Services/CommandOutputCapture.cs`** — bounded raw-capture
+  store (small hot char buffer + scratch-file spill, offset-based
+  slice readers + bounded current-command snapshot for timeout
+  `partialOutput`). Worker-private; distinct from the public
+  `ripple.output` spill directory.
+- **`Services/CompletedCommandSnapshot.cs`** — lightweight record
+  the tracker emits on primary completion: capture handle,
+  command-window offsets, exit metadata, cwd, shell family, settle
+  policy, and the exact `ptyPayload` baseline (for deterministic
+  echo stripping).
+- **`Services/CommandOutputFinalizer.cs`** — slice-reader-driven
+  cleaner + `EchoStripper` for `deterministic_byte_match`
+  adapters. Reads from offset-based capture slices instead of
+  rebuilding tracker state from one monolithic in-memory output
+  buffer.
+- **`Services/OutputTruncationHelper.cs`** — preview + spill-file
+  creation, DI-friendly (`IOutputSpillFileSystem`, `IClock`).
+  Returns `OutputTruncationResult(DisplayOutput, SpillFilePath?)`.
+  Accepts a live-path predicate for lease-aware cleanup.
+  Threshold `15_000`, head `~1_000`, tail `~2_000`, newline scan
+  `±200`, retention `120 min`. Files still referenced by undrained
+  cached results are never cleaned.
 - **34 `VtLiteStateTests` asserts** including a "split at every
   byte boundary agrees with whole-feed final state" property test,
   alt-screen save/restore preservation of the primary cursor, SGR
@@ -49,6 +77,16 @@ free so live tracking runs on every platform — not just Unix.
   release: 1.00 MiB in 5.7 ms (174 MiB/s) — the memo's `<5%`
   overhead bar is cleared with three orders of magnitude of
   headroom.
+- **Spill / finalize unit + integration coverage** — new test
+  classes `OutputTruncationHelper Tests` (32 asserts),
+  `CommandOutputCapture Tests` (20), `CommandOutputFinalizer
+  Tests` (22), and `ConsoleWorker Cache Unit Tests` (59) cover
+  the truncation, spill-file lifecycle, lease-aware cleanup,
+  capture window semantics, and inline-vs-deferred delivery
+  routing introduced this release. End-to-end
+  `SpillIntegrationTests` (41 asserts under `--test --e2e`)
+  cover oversized inline + deferred spill, lease-aware cleanup,
+  and trailing-byte on-disk slice checks.
 
 ### Changed
 - **DSR reply on Unix uses live cursor state.** The reply now
@@ -76,6 +114,21 @@ free so live tracking runs on every platform — not just Unix.
   earlier `!OperatingSystem.IsWindows()` gate (added when GC
   pressure caused intermittent deno adapter-test flakes) was
   deleted.
+- **Finalize ownership moved from `CommandTracker` to
+  `ConsoleWorker`.** The tracker now only emits a
+  `CompletedCommandSnapshot` on primary completion; the worker
+  runs cleaning, echo-stripping, truncation, and cache insertion
+  in one place. `ConsoleManager` no longer reassembles output via
+  `drain_post_output` — it forwards the worker's finalized
+  `CommandResult` directly. Inline `execute_command` and deferred
+  `wait_for_completion` therefore always read from the same
+  finalized result shape (`output`, `spillFilePath`, `statusLine`,
+  `exitCode`).
+- **`Build.ps1` gains `-Sign`.** Optional Authenticode signing of
+  `dist/ripple.exe` before the npm/dist deploy step. Defaults
+  preserve the existing unsigned dev workflow; pass `-Sign` for
+  publish builds. PFX password is read interactively via
+  `Read-Host -AsSecureString` — never echoed, never logged.
 
 ### Fixed
 - **Cross-chunk DSR queries no longer leak downstream.** The old
@@ -85,6 +138,26 @@ free so live tracking runs on every platform — not just Unix.
   sat indefinitely waiting for a reply that never fired. The new
   `AnswerAndStripDsr` buffers the partial prefix, completes it on
   the next chunk, replies once, and strips the bytes from output.
+- **Orphaned inline `TaskCompletionSource` on
+  `HandleExecuteAsync` timeout / shell-exit branches.** Previously
+  the inline TCS was not detached on those branches, so a timed-
+  out snapshot could be delivered to a stale TCS instead of the
+  worker cache — breaking `wait_for_completion`'s ability to
+  drain timed-out commands. Per-id routing through the new
+  `_inlineDeliveriesById` dictionary closes the race; orphaned
+  ids fall through to `_cachedResults`.
+- **OSC stripping no longer swallows past a prior ST terminator.**
+  `Services/CommandOutputFinalizer.cs`'s OSC alternative
+  `\x1b\][^\x07]*\x07` previously matched across an earlier
+  `ESC \\` (ST) terminator to a later bare BEL when input mixed
+  ST-terminated title OSCs with subsequent BELs (commonly emitted
+  in xterm/iTerm sessions). Tightened to
+  `\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)` so each OSC stops at its
+  own terminator.
+- **Unix spill file permissions.** Spill directory is created
+  `0700` and spill files `0600` via `UnixCreateMode` on .NET 9 —
+  command output (which can contain secrets) is no longer world-
+  readable on multi-user hosts.
 
 ## [0.8.0] - 2026-04-16
 
