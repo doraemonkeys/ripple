@@ -4,294 +4,71 @@ All notable changes to ripple are documented here. Format based on [Keep a Chang
 
 ## [0.10.0] - 2026-04-20
 
-Three parallel rounds land in the same release. **(1) Live virtual-
-terminal cursor tracking** — ripple now keeps an authoritative
-VT-100 interpreter advanced from every PTY chunk and answers DSR
-(`\x1b[6n`) cursor-position queries from real state instead of the
-static "near the bottom of the screen" + prompt-heuristic column
-it shipped with. Closes the long-standing Unix drift where
-PSReadLine's up-arrow history recall painted over the active
-prompt, and bash readline wrapped long input lines into the wrong
-column, after a few AI commands' worth of output had scrolled
-past. **(2) Oversized command output is spilled to a temp file**
-(closes #1, PR #5) — outputs over `15,000` chars are written to a
-worker-owned spill file (`%TEMP%\ripple.output\` on Windows,
-`${TMPDIR:-/tmp}/ripple.output/` on Unix) and the MCP response
-returns a head + tail preview embedding the spill path. Inline
-`execute_command` and deferred `wait_for_completion` now flow
-through a shared finalize-once boundary so both delivery modes
-return the same `CommandResult` shape. **(3) Command-output
-extraction is rebuilt as a per-command fork of the live VT
-interpreter** (closes #4) — at OSC C the worker snapshots the
-session-wide `_vtState` and hands the snapshot to a new
-`CommandOutputRenderer` initialised from it. ConPTY's
-post-alt-screen and post-prompt redraw bursts target cells whose
-baseline values match what's being rewritten, so a per-cell change
-detector recognises them as idempotent overwrites and they stay
-out of the AI-facing MCP response. Alt-screen entry/exit collapses
-to an `[interactive screen session]` placeholder; soft-wrapped
-logical lines are re-joined at render time so a narrow PTY can't
-fragment a single `git log --oneline` entry.
+Three parallel rounds land in the same release. **(1) Live virtual-terminal cursor tracking** — ripple now keeps an authoritative VT-100 interpreter advanced from every PTY chunk and answers DSR (`\x1b[6n`) cursor-position queries from real state instead of the static "near the bottom of the screen" + prompt-heuristic column it shipped with. Closes the long-standing Unix drift where PSReadLine's up-arrow history recall painted over the active prompt, and bash readline wrapped long input lines into the wrong column, after a few AI commands' worth of output had scrolled past. **(2) Oversized command output is spilled to a temp file** (closes #1, PR #5) — outputs over `15,000` chars are written to a worker-owned spill file (`%TEMP%\ripple.output\` on Windows, `${TMPDIR:-/tmp}/ripple.output/` on Unix) and the MCP response returns a head + tail preview embedding the spill path. Inline `execute_command` and deferred `wait_for_completion` now flow through a shared finalize-once boundary so both delivery modes return the same `CommandResult` shape. **(3) Command-output extraction is rebuilt as a per-command fork of the live VT interpreter** (closes #4) — at OSC C the worker snapshots the session-wide `_vtState` and hands the snapshot to a new `CommandOutputRenderer` initialised from it. ConPTY's post-alt-screen and post-prompt redraw bursts target cells whose baseline values match what's being rewritten, so a per-cell change detector recognises them as idempotent overwrites and they stay out of the AI-facing MCP response. Alt-screen entry/exit collapses to an `[interactive screen session]` placeholder; soft-wrapped logical lines are re-joined at render time so a narrow PTY can't fragment a single `git log --oneline` entry.
+
+### Acknowledgments
+
+- @doraemonkeys — reported the oversized-output overflow as #1 and contributed PR #5 with the spill-to-temp-file fix that round (2) is built on.
+- @luchezarno — reported #4 with a detailed Git Bash log that pinpointed the ConPTY post-prompt redraw burst as the cause of the dropped grep matches; the round (3) renderer rewrite would have taken much longer to land without that reproducer.
 
 ### Added
-- **`Services/VtLiteState.cs`** — the VT-100 interpreter formerly
-  embedded in `CommandTracker` is now a public class with a
-  streaming `Feed(ReadOnlySpan<char>)` entry point. A 16 KB
-  pending-escape buffer stitches CSI / OSC sequences split across
-  PTY reads (`ParseEscape` returns -1 on incomplete; `Feed`
-  buffers the tail and flushes on the next call). The static
-  `VtLite(...)` one-shot helper is preserved for compatibility.
-- **CSI catalog growth.** `ECH` (`\e[nX`), `DCH` (`\e[nP`), `ICH`
-  (`\e[n@`), `IL` (`\e[nL`), `DL` (`\e[nM`) handlers added —
-  readline / PSReadLine emit these for in-line editing and they
-  were previously dropped to the silent-default branch, leaving
-  the rendered grid divergent from the live screen.
-- **`ConsoleWorker.AnswerAndStripDsr`** — pure static helper
-  modelled on `ReplaceOscTitle` that carries up to 3 partial DSR
-  prefix bytes (`\x1b`, `\x1b[`, or `\x1b[6`) across PTY reads via
-  a `ref string pendingPrefix`. Fires the reply callback once per
-  detected DSR (was one reply per chunk regardless of count) and
-  strips the partial prefix from output so it never leaks
-  downstream into `OscParser` / mirror / AI-visible bytes.
-- **`Services/CommandOutputCapture.cs`** — bounded raw-capture
-  store (small hot char buffer + scratch-file spill, offset-based
-  slice readers + bounded current-command snapshot for timeout
-  `partialOutput`). Worker-private; distinct from the public
-  `ripple.output` spill directory.
-- **`Services/CompletedCommandSnapshot.cs`** — lightweight record
-  the tracker emits on primary completion: capture handle,
-  command-window offsets, exit metadata, cwd, shell family, settle
-  policy, and the exact `ptyPayload` baseline (for deterministic
-  echo stripping).
-- **`Services/CommandOutputFinalizer.cs`** — slice-reader-driven
-  cleaner + `EchoStripper` for `deterministic_byte_match`
-  adapters. Reads from offset-based capture slices instead of
-  rebuilding tracker state from one monolithic in-memory output
-  buffer.
-- **`Services/OutputTruncationHelper.cs`** — preview + spill-file
-  creation, DI-friendly (`IOutputSpillFileSystem`, `IClock`).
-  Returns `OutputTruncationResult(DisplayOutput, SpillFilePath?)`.
-  Accepts a live-path predicate for lease-aware cleanup.
-  Threshold `15_000`, head `~1_000`, tail `~2_000`, newline scan
-  `±200`, retention `120 min`. Files still referenced by undrained
-  cached results are never cleaned.
-- **34 `VtLiteStateTests` asserts** including a "split at every
-  byte boundary agrees with whole-feed final state" property test,
-  alt-screen save/restore preservation of the primary cursor, SGR
-  no-shift verification (the regression the prior byte-counter
-  estimator hit), bracketed-paste passthrough, and pending-buffer
-  overflow safety. Plus 29 new `ConsoleWorker Unit Tests` asserts
-  covering all three DSR split boundaries, three-way splits,
-  false-partial flush, and non-DSR CSI passthrough.
-- **1 MiB Feed throughput bench** prints at the end of `--test`
-  (informational, not a pass/fail). Baseline on a Win11 AOT
-  release: 1.00 MiB in 5.7 ms (174 MiB/s) — the memo's `<5%`
-  overhead bar is cleared with three orders of magnitude of
-  headroom.
-- **Spill / finalize unit + integration coverage** — new test
-  classes `OutputTruncationHelper Tests` (32 asserts),
-  `CommandOutputCapture Tests` (20), `CommandOutputFinalizer
-  Tests` (22), and `ConsoleWorker Cache Unit Tests` (59) cover
-  the truncation, spill-file lifecycle, lease-aware cleanup,
-  capture window semantics, and inline-vs-deferred delivery
-  routing introduced this release. End-to-end
-  `SpillIntegrationTests` (41 asserts under `--test --e2e`)
-  cover oversized inline + deferred spill, lease-aware cleanup,
-  and trailing-byte on-disk slice checks.
+
+- **`Services/VtLiteState.cs`** — the VT-100 interpreter formerly embedded in `CommandTracker` is now a public class with a streaming `Feed(ReadOnlySpan<char>)` entry point. A 16 KB pending-escape buffer stitches CSI / OSC sequences split across PTY reads (`ParseEscape` returns -1 on incomplete; `Feed` buffers the tail and flushes on the next call). The static `VtLite(...)` one-shot helper is preserved for compatibility.
+- **CSI catalog growth.** `ECH` (`\e[nX`), `DCH` (`\e[nP`), `ICH` (`\e[n@`), `IL` (`\e[nL`), `DL` (`\e[nM`) handlers added — readline / PSReadLine emit these for in-line editing and they were previously dropped to the silent-default branch, leaving the rendered grid divergent from the live screen.
+- **`ConsoleWorker.AnswerAndStripDsr`** — pure static helper modelled on `ReplaceOscTitle` that carries up to 3 partial DSR prefix bytes (`\x1b`, `\x1b[`, or `\x1b[6`) across PTY reads via a `ref string pendingPrefix`. Fires the reply callback once per detected DSR (was one reply per chunk regardless of count) and strips the partial prefix from output so it never leaks downstream into `OscParser` / mirror / AI-visible bytes.
+- **`Services/CommandOutputCapture.cs`** — bounded raw-capture store (small hot char buffer + scratch-file spill, offset-based slice readers + bounded current-command snapshot for timeout `partialOutput`). Worker-private; distinct from the public `ripple.output` spill directory.
+- **`Services/CompletedCommandSnapshot.cs`** — lightweight record the tracker emits on primary completion: capture handle, command-window offsets, exit metadata, cwd, shell family, settle policy, and the exact `ptyPayload` baseline (for deterministic echo stripping).
+- **`Services/CommandOutputFinalizer.cs`** — slice-reader-driven cleaner + `EchoStripper` for `deterministic_byte_match` adapters. Reads from offset-based capture slices instead of rebuilding tracker state from one monolithic in-memory output buffer.
+- **`Services/OutputTruncationHelper.cs`** — preview + spill-file creation, DI-friendly (`IOutputSpillFileSystem`, `IClock`). Returns `OutputTruncationResult(DisplayOutput, SpillFilePath?)`. Accepts a live-path predicate for lease-aware cleanup. Threshold `15_000`, head `~1_000`, tail `~2_000`, newline scan `±200`, retention `120 min`. Files still referenced by undrained cached results are never cleaned.
+- **34 `VtLiteStateTests` asserts** including a "split at every byte boundary agrees with whole-feed final state" property test, alt-screen save/restore preservation of the primary cursor, SGR no-shift verification (the regression the prior byte-counter estimator hit), bracketed-paste passthrough, and pending-buffer overflow safety. Plus 29 new `ConsoleWorker Unit Tests` asserts covering all three DSR split boundaries, three-way splits, false-partial flush, and non-DSR CSI passthrough.
+- **1 MiB Feed throughput bench** prints at the end of `--test` (informational, not a pass/fail). Baseline on a Win11 AOT release: 1.00 MiB in 5.7 ms (174 MiB/s) — the memo's `<5%` overhead bar is cleared with three orders of magnitude of headroom.
+- **Spill / finalize unit + integration coverage** — new test classes `OutputTruncationHelper Tests` (32 asserts), `CommandOutputCapture Tests` (20), `CommandOutputFinalizer Tests` (22), and `ConsoleWorker Cache Unit Tests` (59) cover the truncation, spill-file lifecycle, lease-aware cleanup, capture window semantics, and inline-vs-deferred delivery routing introduced this release. End-to-end `SpillIntegrationTests` (41 asserts under `--test --e2e`) cover oversized inline + deferred spill, lease-aware cleanup, and trailing-byte on-disk slice checks.
 
 ### Changed
-- **DSR reply on Unix uses live cursor state.** The reply now
-  reads `_vtState.Row+1`/`Col+1` instead of static row +
-  `EstimateCursorCol`, with the heuristic retained only as a
-  fallback for the brief pre-first-chunk window during shell
-  startup. Windows path is dormant in practice — ConPTY
-  intercepts DSR before ripple sees it.
-- **`peek_console` snapshot routes through live state.**
-  `CommandTracker.GetRecentOutputSnapshot` returns
-  `_vtState.Render()` directly instead of re-parsing the 4 KB
-  recent-output ring through a fresh `VtLite()` on every call.
-  The tracker keeps its own `VtLiteState` fed from `FeedOutput`,
-  reset on the same triggers as the ring (first OSC A, every OSC
-  C, `ClearRecentOutput`, terminal resize). The raw ring buffer
-  is retained for `GetRawRecentBytes()` — `ModeDetector` reads
-  bytes pre-VT-reshape and can't use the rendered snapshot.
-- **Allocation-minimal `Feed` hot path.** `Feed`, `ParseEscape`,
-  and `ApplyCsi` now operate on `ReadOnlySpan<char>` directly —
-  no `new string(input)` per chunk; `paramsStr.Split(';')`
-  replaced with a zero-alloc `GetParam` helper that scans the
-  span. Pending merges use a 512-char `stackalloc` buffer with
-  `ArrayPool<char>` fallback for larger merges. With allocation
-  pressure removed, live tracking runs on every platform; the
-  earlier `!OperatingSystem.IsWindows()` gate (added when GC
-  pressure caused intermittent deno adapter-test flakes) was
-  deleted.
-- **Finalize ownership moved from `CommandTracker` to
-  `ConsoleWorker`.** The tracker now only emits a
-  `CompletedCommandSnapshot` on primary completion; the worker
-  runs cleaning, echo-stripping, truncation, and cache insertion
-  in one place. `ConsoleManager` no longer reassembles output via
-  `drain_post_output` — it forwards the worker's finalized
-  `CommandResult` directly. Inline `execute_command` and deferred
-  `wait_for_completion` therefore always read from the same
-  finalized result shape (`output`, `spillFilePath`, `statusLine`,
-  `exitCode`).
-- **`Build.ps1` gains `-Sign`.** Optional Authenticode signing of
-  `dist/ripple.exe` before the npm/dist deploy step. Defaults
-  preserve the existing unsigned dev workflow; pass `-Sign` for
-  publish builds. PFX password is read interactively via
-  `Read-Host -AsSecureString` — never echoed, never logged.
+
+- **DSR reply on Unix uses live cursor state.** The reply now reads `_vtState.Row+1`/`Col+1` instead of static row + `EstimateCursorCol`, with the heuristic retained only as a fallback for the brief pre-first-chunk window during shell startup. Windows path is dormant in practice — ConPTY intercepts DSR before ripple sees it.
+- **`peek_console` snapshot routes through live state.** `CommandTracker.GetRecentOutputSnapshot` returns `_vtState.Render()` directly instead of re-parsing the 4 KB recent-output ring through a fresh `VtLite()` on every call. The tracker keeps its own `VtLiteState` fed from `FeedOutput`, reset on the same triggers as the ring (first OSC A, every OSC C, `ClearRecentOutput`, terminal resize). The raw ring buffer is retained for `GetRawRecentBytes()` — `ModeDetector` reads bytes pre-VT-reshape and can't use the rendered snapshot.
+- **Allocation-minimal `Feed` hot path.** `Feed`, `ParseEscape`, and `ApplyCsi` now operate on `ReadOnlySpan<char>` directly — no `new string(input)` per chunk; `paramsStr.Split(';')` replaced with a zero-alloc `GetParam` helper that scans the span. Pending merges use a 512-char `stackalloc` buffer with `ArrayPool<char>` fallback for larger merges. With allocation pressure removed, live tracking runs on every platform; the earlier `!OperatingSystem.IsWindows()` gate (added when GC pressure caused intermittent deno adapter-test flakes) was deleted.
+- **Finalize ownership moved from `CommandTracker` to `ConsoleWorker`.** The tracker now only emits a `CompletedCommandSnapshot` on primary completion; the worker runs cleaning, echo-stripping, truncation, and cache insertion in one place. `ConsoleManager` no longer reassembles output via `drain_post_output` — it forwards the worker's finalized `CommandResult` directly. Inline `execute_command` and deferred `wait_for_completion` therefore always read from the same finalized result shape (`output`, `spillFilePath`, `statusLine`, `exitCode`).
+- **`Build.ps1` gains `-Sign`.** Optional Authenticode signing of `dist/ripple.exe` before the npm/dist deploy step. Defaults preserve the existing unsigned dev workflow; pass `-Sign` for publish builds. PFX password is read interactively via `Read-Host -AsSecureString` — never echoed, never logged.
 
 ### Fixed
-- **Cross-chunk DSR queries no longer leak downstream.** The old
-  `text.Contains("\x1b[6n")` substring check missed DSR queries
-  whose 4 bytes straddled two PTY reads. The partial ESC bytes
-  flowed into the parser / mirror / output stream while the shell
-  sat indefinitely waiting for a reply that never fired. The new
-  `AnswerAndStripDsr` buffers the partial prefix, completes it on
-  the next chunk, replies once, and strips the bytes from output.
-- **Orphaned inline `TaskCompletionSource` on
-  `HandleExecuteAsync` timeout / shell-exit branches.** Previously
-  the inline TCS was not detached on those branches, so a timed-
-  out snapshot could be delivered to a stale TCS instead of the
-  worker cache — breaking `wait_for_completion`'s ability to
-  drain timed-out commands. Per-id routing through the new
-  `_inlineDeliveriesById` dictionary closes the race; orphaned
-  ids fall through to `_cachedResults`.
-- **OSC stripping no longer swallows past a prior ST terminator.**
-  `Services/CommandOutputFinalizer.cs`'s OSC alternative
-  `\x1b\][^\x07]*\x07` previously matched across an earlier
-  `ESC \\` (ST) terminator to a later bare BEL when input mixed
-  ST-terminated title OSCs with subsequent BELs (commonly emitted
-  in xterm/iTerm sessions). Tightened to
-  `\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)` so each OSC stops at its
-  own terminator.
-- **Unix spill file permissions.** Spill directory is created
-  `0700` and spill files `0600` via `UnixCreateMode` on .NET 9 —
-  command output (which can contain secrets) is no longer world-
-  readable on multi-user hosts.
-- **Progress-bar redraws no longer flood the MCP `output`.**
-  `CommandOutputFinalizer.StripAnsi` is rewritten as a grid-less
-  line + cursor-row tracker: bare `\r` overwrites the current line
-  in place (dotnet-build / pip-download style spinners), CSI
-  cursor-up (`A`) rewinds the row index, CSI erase-in-line (`K`)
-  / erase-in-display (`J`) clear the current row, `\b` undoes one
-  character. Previously these were stripped as raw bytes, so each
-  redraw landed as a fresh line and a `./Build.ps1` invocation
-  filled the AI-visible output with dozens of stale frames. SGR
-  (color) is still kept verbatim. The visible-terminal mirror is
-  untouched — the human still sees a live progress bar exactly as
-  the shell intended; only the AI-facing `output` collapses.
+
+- **Cross-chunk DSR queries no longer leak downstream.** The old `text.Contains("\x1b[6n")` substring check missed DSR queries whose 4 bytes straddled two PTY reads. The partial ESC bytes flowed into the parser / mirror / output stream while the shell sat indefinitely waiting for a reply that never fired. The new `AnswerAndStripDsr` buffers the partial prefix, completes it on the next chunk, replies once, and strips the bytes from output.
+- **Orphaned inline `TaskCompletionSource` on `HandleExecuteAsync` timeout / shell-exit branches.** Previously the inline TCS was not detached on those branches, so a timed-out snapshot could be delivered to a stale TCS instead of the worker cache — breaking `wait_for_completion`'s ability to drain timed-out commands. Per-id routing through the new `_inlineDeliveriesById` dictionary closes the race; orphaned ids fall through to `_cachedResults`.
+- **OSC stripping no longer swallows past a prior ST terminator.** `Services/CommandOutputFinalizer.cs`'s OSC alternative `\x1b\][^\x07]*\x07` previously matched across an earlier `ESC \\` (ST) terminator to a later bare BEL when input mixed ST-terminated title OSCs with subsequent BELs (commonly emitted in xterm/iTerm sessions). Tightened to `\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)` so each OSC stops at its own terminator.
+- **Unix spill file permissions.** Spill directory is created `0700` and spill files `0600` via `UnixCreateMode` on .NET 9 — command output (which can contain secrets) is no longer world-readable on multi-user hosts.
+- **Progress-bar redraws no longer flood the MCP `output`.** `CommandOutputFinalizer.StripAnsi` is rewritten as a grid-less line + cursor-row tracker: bare `\r` overwrites the current line in place (dotnet-build / pip-download style spinners), CSI cursor-up (`A`) rewinds the row index, CSI erase-in-line (`K`) / erase-in-display (`J`) clear the current row, `\b` undoes one character. Previously these were stripped as raw bytes, so each redraw landed as a fresh line and a `./Build.ps1` invocation filled the AI-visible output with dozens of stale frames. SGR (color) is still kept verbatim. The visible-terminal mirror is untouched — the human still sees a live progress bar exactly as the shell intended; only the AI-facing `output` collapses.
 
 ### Renderer overhaul (round 3 — closes #4)
 
 #### Added
 
-- **`Services/CommandOutputRenderer.cs`** — cell-based per-command
-  fork of the live `VtLiteState`. Constructor accepts an optional
-  `VtLiteSnapshot` baseline; rows are pre-populated from the
-  snapshot grid, cursor / saved-cursor / scroll-region / SGR /
-  alt-screen state carry over, and each baseline row stashes a
-  `BaselineCells` immutable copy for the per-cell change detector
-  at `Render` time. Implements CUU/CUD/CUF/CUB/CNL/CPL/CHA/VPA,
-  CUP/HVP, EL/ED, ECH, DCH/ICH, IL/DL, save/restore, real
-  alt-screen save/restore semantics, and viewport-top tracking
-  that increments on LFs crossing the snapshot's viewport bottom
-  so subsequent CUP coordinates land on the rows ConPTY actually
-  intends.
-- **`VtLiteState.Snapshot()` + per-row soft-wrap + active-SGR
-  tracking.** New `VtLiteSnapshot` deep-copy record carries
-  primary + alternate grids, soft-wrap flags, cursor, saved
-  cursor, scroll region, alt-screen flag, and the active SGR
-  carry-over. `WriteChar`'s auto-wrap now flips a per-row
-  "continued from above" flag (set on wrap, cleared on hard LF /
-  EraseLine mode 2 / EraseDisplay; shifted in lockstep with grid
-  rows on `ScrollUp` / `ScrollDown`). `RecordSgr` accumulates
-  non-reset SGR sequences since the last `\e[m` / `\e[0m` /
-  leading-0 compound reset so the snapshot's `ActiveSgr` can seed
-  the renderer's first-cell prefix.
-- **`CompletedCommandSnapshot.VtBaseline`** — optional snapshot
-  field threaded through `CommandTracker` ↔ `ConsoleWorker` ↔
-  `CommandOutputFinalizer.Clean`. The worker snapshots
-  `_vtState` (session-wide, not the tracker's per-OSC-C-reset
-  one) right before forwarding the OSC C event so the renderer
-  receives the screen state ConPTY has at command start.
-- **Soft-wrap re-joining at render time.** Rows whose
-  `ContinuedFromAbove` flag is set are appended to the previous
-  emitted line without an inter-row newline, so a long `git log
-  --oneline` entry that auto-wrapped at the PTY's right margin
-  reaches the AI as one logical line.
-- **Alt-screen as placeholder.** Entry switches to a separate row
-  list for alt-buffer writes; exit restores the main-buffer
-  cursor and inserts a single `[interactive screen session]` line
-  in the rendered output. ConPTY's post-exit redraw of the saved
-  main buffer is naturally absorbed by the per-cell baseline diff
-  (cells already hold the expected values).
-- **Regex-prompt cap.** `RegexPromptDetector.Scan` returns
-  `(Start, End)` per match (was end-only). Worker fires synthetic
-  `CommandFinished` + `PromptStart` at `Start` so the visible
-  prompt characters are excluded from the
-  `[commandStart, OSC A]` window — fixes trailing `(Pdb)` /
-  `DB<N>` / `>` leak for pdb / perldb / python / and any other
-  regex-prompt REPL. `Start` also backs past contiguous non-reset
-  SGR sequences immediately preceding the prompt match (REPL
-  prompt decoration), bounded at any reset SGR (the prior
-  command's "stop coloring" closer) and at any non-SGR byte
-  including whitespace.
-- **23 new tests** covering snapshot independence, soft-wrap
-  flags, SGR set/reset/compound, baseline-skip-pre-command,
-  ConPTY-repaint-idempotent, alt-screen+baseline placeholder,
-  soft-wrap re-join, regex-prompt Start vs End semantics,
-  prompt-decoration SGR back-up, and reset-SGR halt. All 728
-  tests pass.
+- **`Services/CommandOutputRenderer.cs`** — cell-based per-command fork of the live `VtLiteState`. Constructor accepts an optional `VtLiteSnapshot` baseline; rows are pre-populated from the snapshot grid, cursor / saved-cursor / scroll-region / SGR / alt-screen state carry over, and each baseline row stashes a `BaselineCells` immutable copy for the per-cell change detector at `Render` time. Implements CUU/CUD/CUF/CUB/CNL/CPL/CHA/VPA, CUP/HVP, EL/ED, ECH, DCH/ICH, IL/DL, save/restore, real alt-screen save/restore semantics, and viewport-top tracking that increments on LFs crossing the snapshot's viewport bottom so subsequent CUP coordinates land on the rows ConPTY actually intends.
+- **`VtLiteState.Snapshot()` + per-row soft-wrap + active-SGR tracking.** New `VtLiteSnapshot` deep-copy record carries primary + alternate grids, soft-wrap flags, cursor, saved cursor, scroll region, alt-screen flag, and the active SGR carry-over. `WriteChar`'s auto-wrap now flips a per-row "continued from above" flag (set on wrap, cleared on hard LF / EraseLine mode 2 / EraseDisplay; shifted in lockstep with grid rows on `ScrollUp` / `ScrollDown`). `RecordSgr` accumulates non-reset SGR sequences since the last `\e[m` / `\e[0m` / leading-0 compound reset so the snapshot's `ActiveSgr` can seed the renderer's first-cell prefix.
+- **`CompletedCommandSnapshot.VtBaseline`** — optional snapshot field threaded through `CommandTracker` ↔ `ConsoleWorker` ↔ `CommandOutputFinalizer.Clean`. The worker snapshots `_vtState` (session-wide, not the tracker's per-OSC-C-reset one) right before forwarding the OSC C event so the renderer receives the screen state ConPTY has at command start.
+- **Soft-wrap re-joining at render time.** Rows whose `ContinuedFromAbove` flag is set are appended to the previous emitted line without an inter-row newline, so a long `git log --oneline` entry that auto-wrapped at the PTY's right margin reaches the AI as one logical line.
+- **Alt-screen as placeholder.** Entry switches to a separate row list for alt-buffer writes; exit restores the main-buffer cursor and inserts a single `[interactive screen session]` line in the rendered output. ConPTY's post-exit redraw of the saved main buffer is naturally absorbed by the per-cell baseline diff (cells already hold the expected values).
+- **Regex-prompt cap.** `RegexPromptDetector.Scan` returns `(Start, End)` per match (was end-only). Worker fires synthetic `CommandFinished` + `PromptStart` at `Start` so the visible prompt characters are excluded from the `[commandStart, OSC A]` window — fixes trailing `(Pdb)` / `DB<N>` / `>` leak for pdb / perldb / python / and any other regex-prompt REPL. `Start` also backs past contiguous non-reset SGR sequences immediately preceding the prompt match (REPL prompt decoration), bounded at any reset SGR (the prior command's "stop coloring" closer) and at any non-SGR byte including whitespace.
+- **23 new tests** covering snapshot independence, soft-wrap flags, SGR set/reset/compound, baseline-skip-pre-command, ConPTY-repaint-idempotent, alt-screen+baseline placeholder, soft-wrap re-join, regex-prompt Start vs End semantics, prompt-decoration SGR back-up, and reset-SGR halt. All 728 tests pass.
 
 #### Changed
 
-- **Bare `\r` is now cursor-reset only (no row clear).** Matches
-  what the human sees in the live terminal — verified
-  empirically against Git Bash via ripple MCP. The legacy
-  "clear the row on bare CR" is intentionally lossier than
-  terminal spec; with the cell-based renderer in place, the spec
-  semantics produce identical results for properly-formed
-  progress bars (which use `\r\x1b[K` or full-replacement
-  rewrites) and slightly truthier results for short rewrites
-  (which match the live-terminal residue).
-- **Node.js integration script (`integration.js`) emits OSC bytes
-  BEFORE the visible prompt** instead of after. Same pattern
-  pwsh's prompt function has always used. Eliminates the trailing
-  `> ` on every node REPL command. OSC sequences are zero-width
-  so emitting them at any cursor position is safe; the previous
-  "after" ordering was conservative but unnecessary.
+- **Bare `\r` is now cursor-reset only (no row clear).** Matches what the human sees in the live terminal — verified empirically against Git Bash via ripple MCP. The legacy "clear the row on bare CR" is intentionally lossier than terminal spec; with the cell-based renderer in place, the spec semantics produce identical results for properly-formed progress bars (which use `\r\x1b[K` or full-replacement rewrites) and slightly truthier results for short rewrites (which match the live-terminal residue).
+- **Node.js integration script (`integration.js`) emits OSC bytes BEFORE the visible prompt** instead of after. Same pattern pwsh's prompt function has always used. Eliminates the trailing `> ` on every node REPL command. OSC sequences are zero-width so emitting them at any cursor position is safe; the previous "after" ordering was conservative but unnecessary.
 
 #### Fixed
 
-- **Issue #4 — `echo … | grep` on Git Bash via ConPTY no longer
-  drops trailing match lines.** ConPTY emits a screen-redraw
-  burst around prompts that contains real grep output
-  (`cherry`, `elderberry`) and absolute cursor positioning the
-  legacy `StripAnsi` silently dropped, leaving only the first
-  match (`banana`) in the cleaned output. The new renderer
-  processes the cursor positioning correctly and the per-cell
-  baseline diff treats matching repaint as idempotent — all
-  three matches survive intact.
-- **Trailing `\e[m` reset SGR is no longer lost** when the
-  output ends with `text\r\n\e[m`. `Render` flushes pending SGR
-  to the last non-empty row's `TrailingSgr` before iterating
-  rows, so end-of-output color resets reach downstream consumers
-  instead of leaving "color stuck on" state.
+- **Issue #4 — `echo … | grep` on Git Bash via ConPTY no longer drops trailing match lines.** ConPTY emits a screen-redraw burst around prompts that contains real grep output (`cherry`, `elderberry`) and absolute cursor positioning the legacy `StripAnsi` silently dropped, leaving only the first match (`banana`) in the cleaned output. The new renderer processes the cursor positioning correctly and the per-cell baseline diff treats matching repaint as idempotent — all three matches survive intact.
+- **Trailing `\e[m` reset SGR is no longer lost** when the output ends with `text\r\n\e[m`. `Render` flushes pending SGR to the last non-empty row's `TrailingSgr` before iterating rows, so end-of-output color resets reach downstream consumers instead of leaving "color stuck on" state.
 
 #### Known limitation
 
-- **First alt-screen run on a fresh console after one or more
-  prior non-alt commands** may include ConPTY's post-exit redraw
-  of the visible session history in the MCP response (typically
-  3–6 prior prompts). Subsequent alt-screen runs in the same
-  console produce clean output. Cause: a subtle divergence
-  between `ConsoleWorker._vtState`'s incremental session state
-  and ConPTY's screen view; the first ConPTY full redraw syncs
-  them. Fix deferred to a follow-up PR; mitigation is to either
-  ignore the first noisy response or to discard one warm-up
-  command. Affects only alt-screen workflows (vim, less, htop)
-  on the very first such command of a session.
+- **First alt-screen run on a fresh console after one or more prior non-alt commands** may include ConPTY's post-exit redraw of the visible session history in the MCP response (typically 3–6 prior prompts). Subsequent alt-screen runs in the same console produce clean output. Cause: a subtle divergence between `ConsoleWorker._vtState`'s incremental session state and ConPTY's screen view; the first ConPTY full redraw syncs them. Fix deferred to a follow-up PR; mitigation is to either ignore the first noisy response or to discard one warm-up command. Affects only alt-screen workflows (vim, less, htop) on the very first such command of a session.
+
+### Release infrastructure
+
+- **`.github/workflows/release.yml`** triggers on `v*` tag pushes. NativeAOT publish, unit-test gate, tag/version cross-check, then Azure OIDC login → Authenticode sign via Azure Key Vault (`kv-yotsuda-sign`) → `npm publish --access public --provenance` → `gh release create` with the per-version CHANGELOG section as the release body and `dist\ripple.exe` attached. The `release` environment requires reviewer approval and locks deploys to `v*` tags. Federated credential is repo+environment scoped; no client secret stored in the repo. The npm publish carries an [SLSA build provenance attestation](https://docs.npmjs.com/generating-provenance-statements) that anyone can verify back to this exact workflow run.
 
 ## [0.8.0] - 2026-04-16
 
