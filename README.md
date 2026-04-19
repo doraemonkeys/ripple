@@ -183,6 +183,23 @@ The csproj has `PublishAot=true`, so the published binary is a NativeAOT single-
 
 **Linux / macOS** are functional through the same adapter framework, using forkpty via `posix_spawn` + `POSIX_SPAWN_SETSID` and opening a visible terminal window through `$TERMINAL` (then `gnome-terminal` / `konsole` / `xfce4-terminal` / `mate-terminal` / `alacritty` / `kitty` / `foot` / `xterm` in turn) on Linux and `Terminal.app` on macOS. `start_console` and `execute_command` against bash, pwsh, and python round-trip cleanly; shell integration (OSC 633) fires on all three. See the limitations below for the outstanding interactive-rendering gaps.
 
+## Debugging
+
+Each ripple worker process writes a per-session log to
+`%TEMP%\ripple-worker-{PID}.log` on Windows (or the equivalent temp
+directory on Unix). It captures raw PTY bytes during AI commands,
+adapter-level events (OSC markers, regex prompt matches, continuation
+escapes), and every `send_input` call — enough to reconstruct what the
+shell saw and what ripple did in response. The PID in the filename
+matches the number in console display names (e.g. `#41456 Peony` →
+`ripple-worker-41456.log`), so if a specific console misbehaves you
+can read its log directly.
+
+For adapter work there are also two CLI modes that run without an MCP
+client: `ripple --list-adapters` prints the registry state, and
+`ripple --adapter-tests` runs each adapter's declared contract tests
+against the real interpreter.
+
 ## Known limitations
 
 - **cmd.exe exit codes always read as 0** — cmd's `PROMPT` can't expand `%ERRORLEVEL%` at display time, so AI commands show as `Finished (exit code unavailable)`. Use `pwsh` or `bash` for exit-code-aware work.
