@@ -764,12 +764,19 @@ internal sealed class CommandOutputRenderer
                     // cells with their existing values (idempotent →
                     // no diff → not in output).
                     //
-                    // Without a baseline (the legacy CleanString test
-                    // path) the screen viewport is unknown; an absolute
-                    // CSI H targeting a row before our current cursor
-                    // is almost always ConPTY redraw noise that would
-                    // corrupt earlier output. Clamp upward to the
-                    // current row in that case.
+                    // Without a baseline (CleanString called without a
+                    // VtLiteSnapshot — the test path and any future
+                    // caller that has command bytes but no live screen
+                    // state) the screen viewport is unknown. Following
+                    // an absolute CSI H literally would address rows
+                    // 0..N from the start of OUR row list, which has
+                    // no relationship to any real terminal viewport;
+                    // ConPTY redraw noise would corrupt earlier output.
+                    // The upward clamp here is the maximum-correctness
+                    // behavior given no viewport information — not a
+                    // workaround. With a baseline (the production
+                    // path) we have the correct viewport coordinates
+                    // and trust CSI H verbatim.
                     int wantRow = Math.Max(0, GetParam(paramsSpan, 0, 1) - 1);
                     int newCol = Math.Clamp(GetParam(paramsSpan, 1, 1) - 1, 0, MaxCol);
                     int newRow;

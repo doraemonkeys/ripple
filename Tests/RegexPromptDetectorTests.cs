@@ -262,6 +262,96 @@ public static class RegexPromptDetectorTests
                 $"OSC + CSI sequence: both stripped cleanly (got {offsets.Count})");
         }
 
+        // ---- Prompt SGR-decoration backup ----
+
+        // Non-reset SGR immediately before the visible prompt is
+        // prompt decoration — back the Start past it.
+        {
+            var d = new RegexPromptDetector(@"DB<\d+>");
+            var chunk = "result\x1b[4mDB<2>";  // \e[4m directly before DB
+            var matches = d.Scan(chunk);
+            // Match "DB<2>" at original 10 (after "result" + 4-byte SGR).
+            // Back past the 4-byte \e[4m → Start = 6 (the \e position).
+            Assert(matches.Count == 1,
+                $"prompt-decoration SGR (non-reset): prompt matched (got {matches.Count})");
+            if (matches.Count == 1)
+            {
+                Assert(matches[0].Start == 6,
+                    $"prompt-decoration SGR: Start backed past non-reset SGR (got {matches[0].Start}, expected 6)");
+            }
+        }
+
+        // SGR separated from prompt by whitespace — back-up does NOT
+        // cross whitespace. Crossing would require adapter-specific
+        // knowledge of prompt formatting (is the SGR for the prior
+        // output or for the upcoming prompt?), which we can't infer
+        // from bytes alone. Accept the cosmetic residue.
+        {
+            var d = new RegexPromptDetector(@"DB<\d+>");
+            var chunk = "result\x1b[4m\r\n  DB<2>";
+            var matches = d.Scan(chunk);
+            Assert(matches.Count == 1,
+                $"SGR + CRLF + prompt: prompt matched (got {matches.Count})");
+            if (matches.Count == 1)
+            {
+                // Start sits at 'D' (after the +1 \n bump). Back-up
+                // sees whitespace at start-1 and halts — the
+                // separated SGR stays attributed to the prior content.
+                Assert(matches[0].Start == 14,
+                    $"SGR + whitespace: Start unchanged (got {matches[0].Start}, expected 14)");
+            }
+        }
+
+        // Reset SGR right before the prompt is end-of-prior-output —
+        // do NOT back past it.
+        {
+            var d = new RegexPromptDetector(@">>>");
+            var chunk = "output\x1b[0m>>>";
+            var matches = d.Scan(chunk);
+            // Match ">>>" at original 10 (after "output" + "\e[0m").
+            // Reset SGR is NOT decoration → Start stays at 10.
+            Assert(matches.Count == 1,
+                $"reset SGR before prompt: prompt matched (got {matches.Count})");
+            if (matches.Count == 1)
+            {
+                Assert(matches[0].Start == 10,
+                    $"reset SGR before prompt: Start NOT backed past reset (got {matches[0].Start}, expected 10)");
+            }
+        }
+
+        // Multiple non-reset SGRs back-to-back — back past all of them.
+        {
+            var d = new RegexPromptDetector(@">");
+            var chunk = "x\x1b[1m\x1b[31m>";  // x + \e[1m (4) + \e[31m (5) + > = 11 chars
+            var matches = d.Scan(chunk);
+            // Match at ">" at index 10. Back past "\e[31m" (start at
+            // 9-3=...) actually let's count: positions 0='x', 1-4='\e[1m',
+            // 5-9='\e[31m', 10='>'. Back past \e[31m (5 bytes) → start=5.
+            // Back past \e[1m (4 bytes) → start=1.
+            Assert(matches.Count == 1,
+                $"multiple decoration SGRs: prompt matched (got {matches.Count})");
+            if (matches.Count == 1)
+            {
+                Assert(matches[0].Start == 1,
+                    $"multiple decoration SGRs: Start backed past all (got {matches[0].Start}, expected 1)");
+            }
+        }
+
+        // Compound reset (\e[0;1;31m = reset + set) is still a reset:
+        // do NOT back past it.
+        {
+            var d = new RegexPromptDetector(@">");
+            var chunk = "x\x1b[0;1;31m>";  // 11 chars; > at index 10
+            var matches = d.Scan(chunk);
+            Assert(matches.Count == 1,
+                $"compound-reset SGR: prompt matched (got {matches.Count})");
+            if (matches.Count == 1)
+            {
+                Assert(matches[0].Start == 10,
+                    $"compound-reset SGR: Start NOT backed past reset (got {matches[0].Start}, expected 10)");
+            }
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }

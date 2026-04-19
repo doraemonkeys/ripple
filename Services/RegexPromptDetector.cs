@@ -107,6 +107,17 @@ public sealed class RegexPromptDetector
                 strippedStart++;
             var originalStart = map[strippedStart];
 
+            // Back the start past contiguous SGR-decoration sequences
+            // immediately before the visible prompt — REPL prompts are
+            // often coloured with SGR (perldb's `\e[4m  DB<N>`, custom
+            // PS1 themes, etc.) and those bytes belong with the prompt,
+            // not with the prior command output. We deliberately do NOT
+            // back past SGR resets (`\e[m` / `\e[0m` / leading-0
+            // compounds) — a reset right before the prompt is the prior
+            // output's end-of-coloring marker, which the command should
+            // own, not the prompt.
+            originalStart = BackUpPastSgrDecoration(searchIn, originalStart);
+
             // Convert to chunk-local coordinates. If the match started
             // inside the carry-over buffer, clamp to 0 — anything before
             // the chunk has already been emitted.
@@ -138,6 +149,74 @@ public sealed class RegexPromptDetector
         }
 
         return matches;
+    }
+
+    /// <summary>
+    /// Walk backward from <paramref name="start"/> in
+    /// <paramref name="searchIn"/>, consuming any contiguous
+    /// well-formed SGR sequences (<c>ESC [ &lt;params&gt; m</c>) whose
+    /// parameter list is NOT a reset. Returns the new start position
+    /// (the index of the first byte of the leftmost prompt-decoration
+    /// SGR, or the original start if none found). Reset SGR
+    /// (<c>\e[m</c>, <c>\e[0m</c>, or any compound starting with
+    /// <c>0;</c>) is treated as the end-of-prior-output marker the
+    /// previous command owns and is left in place.
+    /// </summary>
+    private static int BackUpPastSgrDecoration(string searchIn, int start)
+    {
+        // Walk backward past contiguous non-reset SGR sequences that
+        // sit IMMEDIATELY before the prompt match. Stop at any byte
+        // that isn't part of an SGR sequence — including whitespace
+        // and newlines. Crossing whitespace would force this helper
+        // to discriminate between "prior output's trailing styling
+        // that happens to bleed into the prompt area" vs "prompt's
+        // own decoration emitted across a line break", and that
+        // discrimination can't be done from bytes alone without
+        // adapter-specific knowledge of prompt formatting. Better to
+        // accept a small cosmetic residue (perldb-style `\e[4m\n  DB`
+        // pattern leaves an `[4m` at end of command output) than to
+        // overreach with a heuristic that misfires on edge cases.
+        //
+        // Reset SGR (`\e[m`, `\e[0m`, leading-0 compounds) halts the
+        // back-up — those bytes belong to the prior command's output
+        // (its "stop coloring" closer), not to the prompt decoration.
+        while (start > 0 && searchIn[start - 1] == 'm')
+        {
+            int p = start - 2;
+            while (p >= 0 && (searchIn[p] == ';' || (searchIn[p] >= '0' && searchIn[p] <= '9')))
+                p--;
+            if (p < 1 || searchIn[p] != '[' || searchIn[p - 1] != '\x1b')
+                return start;
+
+            var paramsSpan = searchIn.AsSpan(p + 1, (start - 1) - (p + 1));
+            if (IsResetSgrParams(paramsSpan)) return start;
+
+            start = p - 1;
+        }
+        return start;
+    }
+
+    /// <summary>
+    /// True when an SGR parameter list represents a reset
+    /// (full-state clear). Empty params is a reset (<c>\e[m</c>),
+    /// a single token of "0" is a reset (<c>\e[0m</c>), and any
+    /// compound whose first token is "0" begins with a reset
+    /// (<c>\e[0;1;31m</c> = reset then bold red — still a reset).
+    /// </summary>
+    private static bool IsResetSgrParams(ReadOnlySpan<char> paramsSpan)
+    {
+        if (paramsSpan.IsEmpty) return true;
+        // Find the first ';' or end of span.
+        int firstTokEnd = 0;
+        while (firstTokEnd < paramsSpan.Length && paramsSpan[firstTokEnd] != ';')
+            firstTokEnd++;
+        var firstTok = paramsSpan.Slice(0, firstTokEnd);
+        // Empty first token (e.g. ";31m") or all-zero first token
+        // ("0", "00", …) counts as a reset.
+        if (firstTok.IsEmpty) return true;
+        foreach (var ch in firstTok)
+            if (ch != '0') return false;
+        return true;
     }
 
     /// <summary>
