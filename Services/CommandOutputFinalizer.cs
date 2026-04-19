@@ -82,188 +82,23 @@ internal static class CommandOutputFinalizer
     /// Clean a finalized command-window string. Separated from
     /// <see cref="Clean"/> so callers (echo stripping) that already
     /// hold a string don't pay a capture round-trip.
+    ///
+    /// Drives <see cref="CommandOutputRenderer"/> — a cell-based
+    /// terminal emulator that handles cursor positioning, line erase /
+    /// display erase, ECH / DCH / ICH / IL / DL, and alt-screen entry
+    /// (vim / less / htop) as a placeholder. Replaces the legacy
+    /// inline grid-less collapser. The renderer's
+    /// <see cref="CommandOutputRenderer.Render"/> already trims trailing
+    /// blank rows, drops pwsh <c>&gt;&gt;</c> continuation lines, and
+    /// emits SGR (color) bytes verbatim attached to the cells they
+    /// applied to.
     /// </summary>
     public static string CleanString(string raw)
     {
         if (string.IsNullOrEmpty(raw)) return "";
-
-        var stripped = StripAnsi(raw);
-        var lines = stripped.Split('\n');
-        var cleaned = new List<string>(lines.Length);
-        foreach (var rawLine in lines)
-        {
-            var line = rawLine.TrimEnd('\r');
-            var trimmed = line.TrimEnd();
-            // pwsh continuation prompt lines from multi-line input aren't
-            // command output and look jarring in the result.
-            if (trimmed == ">>" || trimmed.StartsWith(">> ")) continue;
-            cleaned.Add(line);
-        }
-
-        return string.Join('\n', cleaned).Trim();
-    }
-
-    /// <summary>
-    /// Strip non-SGR ANSI sequences and collapse progress-bar / spinner
-    /// redraws so the AI-facing MCP output shows the final state of each
-    /// line instead of every intermediate frame. Bare CR overwrites the
-    /// current line (dotnet-build style "\r[10%]\r[20%]..." spinners);
-    /// CSI cursor-up (A) rewinds the committed line list (msbuild's
-    /// "\x1b[NA\x1b[K..." multi-row status block); CSI erase-in-line
-    /// (K) / erase-in-display (J) clear the current line. SGR ('m') is
-    /// kept verbatim for color. OSC / character-set / keypad sequences
-    /// are dropped.
-    ///
-    /// The visible console mirror (`MirrorToVisible`) keeps receiving
-    /// raw PTY bytes, so the human sees a live progress bar the way the
-    /// shell intended. Only the MCP-response `output` passes through
-    /// this collapse.
-    /// </summary>
-    private static string StripAnsi(string text)
-    {
-        // Lines-of-StringBuilder + cursor row model. Each row holds
-        // arbitrary-length content (no column grid — output lines aren't
-        // capped to a viewport width). cursor-up / cursor-down move the
-        // row index; bare CR / EL / ED clear the current row in place;
-        // LF advances row without touching the new row's existing
-        // content (that's the right terminal semantics — LF is a
-        // cursor move, not an overwrite).
-        var lines = new List<StringBuilder> { new StringBuilder() };
-        int row = 0;
-
-        void EnsureRow()
-        {
-            while (lines.Count <= row) lines.Add(new StringBuilder());
-        }
-
-        int i = 0;
-        while (i < text.Length)
-        {
-            char c = text[i];
-            if (c == '\r')
-            {
-                if (i + 1 < text.Length && text[i + 1] == '\n')
-                {
-                    // CRLF — a real newline. Move down a row, leave the
-                    // new row's content alone.
-                    row++;
-                    EnsureRow();
-                    i += 2;
-                }
-                else
-                {
-                    // Bare CR — rewind to column 0 in place; subsequent
-                    // writes overwrite this row.
-                    lines[row].Clear();
-                    i++;
-                }
-            }
-            else if (c == '\n')
-            {
-                row++;
-                EnsureRow();
-                i++;
-            }
-            else if (c == '\b')
-            {
-                // Backspace spinner — drop the last char on the row.
-                if (lines[row].Length > 0) lines[row].Length--;
-                i++;
-            }
-            else if (c == '\x1b')
-            {
-                if (i + 1 >= text.Length) { i++; continue; }
-                char next = text[i + 1];
-                if (next == '[')
-                {
-                    int paramStart = i + 2;
-                    int j = paramStart;
-                    while (j < text.Length && text[j] >= 0x30 && text[j] <= 0x3f) j++;
-                    string paramsStr = j > paramStart ? text.Substring(paramStart, j - paramStart) : "";
-                    while (j < text.Length && text[j] >= 0x20 && text[j] <= 0x2f) j++;
-                    if (j >= text.Length) { i = text.Length; continue; }
-                    char final = text[j];
-                    int n = 1;
-                    if (paramsStr.Length > 0 && int.TryParse(paramsStr, out var parsed) && parsed > 0) n = parsed;
-
-                    if (final == 'm')
-                    {
-                        // SGR — keep verbatim so colors survive.
-                        lines[row].Append(text, i, j - i + 1);
-                    }
-                    else if (final == 'A')
-                    {
-                        // Cursor up N — clamp at row 0.
-                        row = Math.Max(0, row - n);
-                    }
-                    else if (final == 'B')
-                    {
-                        // Cursor down N — extend the row list as needed.
-                        row += n;
-                        EnsureRow();
-                    }
-                    else if (final == 'K' || final == 'J')
-                    {
-                        // Erase in line / display — clear the current
-                        // row. EL/ED mode params (0/1/2) all collapse to
-                        // "forget the current progress frame" in our
-                        // AI-facing collapse model.
-                        lines[row].Clear();
-                    }
-                    // Other CSI finals (CUF/CUB/CUP/HVP/SU/SD/DSR/DA/etc.)
-                    // are dropped silently — they don't contribute to
-                    // what the AI needs to see.
-                    i = j + 1;
-                }
-                else if (next == ']')
-                {
-                    // OSC — drop non-greedily to first BEL or ESC\.
-                    int j = i + 2;
-                    while (j < text.Length)
-                    {
-                        if (text[j] == '\x07') { j++; break; }
-                        if (text[j] == '\x1b' && j + 1 < text.Length && text[j + 1] == '\\') { j += 2; break; }
-                        j++;
-                    }
-                    i = j;
-                }
-                else if (next == '(' || next == ')')
-                {
-                    // Character-set designation \e(<byte> / \e)<byte>.
-                    i = Math.Min(i + 3, text.Length);
-                }
-                else if (next == '=' || next == '>')
-                {
-                    // DECKPAM / DECKPNM — drop.
-                    i += 2;
-                }
-                else
-                {
-                    // Other single-char ESC sequences — drop follower too.
-                    i += 2;
-                }
-            }
-            else
-            {
-                lines[row].Append(c);
-                i++;
-            }
-        }
-
-        // Trim trailing empty rows (left over from a final LF or
-        // cursor-down-without-write) so the join below doesn't tack
-        // a stray newline on the result.
-        int last = lines.Count - 1;
-        while (last >= 0 && lines[last].Length == 0) last--;
-        if (last < 0) return "";
-
-        var sb = new StringBuilder();
-        for (int k = 0; k <= last; k++)
-        {
-            if (k > 0) sb.Append('\n');
-            sb.Append(lines[k]);
-        }
-        return sb.ToString();
+        var renderer = new CommandOutputRenderer();
+        renderer.Feed(raw.AsSpan());
+        return renderer.Render().Trim();
     }
 }
 

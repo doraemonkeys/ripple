@@ -243,6 +243,68 @@ public static class CommandOutputFinalizerTests
                 $"mixed sgr+cr: only final frame survives — got {cleaned}");
         }
 
+        // ---- New renderer features (CSI X / cursor positioning / alt-screen) ----
+
+        // CSI X (ECH) erase N chars at cursor — used by readline /
+        // PSReadLine in-line edits and ConPTY redraws (the exact pattern
+        // from issue #4's Git Bash log: erase + cursor-forward + CRLF
+        // around real text).
+        {
+            var raw = "banana\r\n\x1b[200X\x1b[200C\r\ncherry\r\nelderberry\r\n";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "banana\n\ncherry\nelderberry",
+                $"ech: erase+cuf+crlf collapses to its visible text — got {cleaned.Replace("\n", "\\n")}");
+        }
+
+        // CSI G (CHA) — absolute column position. Sequence: write some
+        // text, jump back to col 0, overwrite first 3 chars, expect the
+        // tail to remain (real terminal semantics, not row-clear).
+        {
+            var raw = "hello world\x1b[1GHEY\n";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "HEYlo world",
+                $"cha: absolute col + overwrite preserves tail — got {cleaned}");
+        }
+
+        // CSI H (CUP) — absolute cursor positioning. Move to (1,1),
+        // write OVR, expect first 3 chars overwritten, tail kept.
+        {
+            var raw = "abcdefghij\x1b[1;1HOVR\n";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "OVRdefghij",
+                $"cup: absolute pos + overwrite preserves tail — got {cleaned}");
+        }
+
+        // Alt-screen entry+exit (vim/less/htop pattern) collapses to a
+        // single placeholder line. Anything drawn inside the alt buffer
+        // is dropped — no flood of redraw frames.
+        {
+            var raw = "before vim\n\x1b[?1049h\x1b[2J\x1b[H~\n~\n~\nlots of redraw\x1b[?1049l\nback to shell\n";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned.Contains("[interactive screen session]"),
+                $"alt-screen: placeholder emitted — got {cleaned.Replace("\n", "\\n")}");
+            Assert(!cleaned.Contains("redraw") && !cleaned.Contains("~"),
+                $"alt-screen: alt-buffer contents dropped — got {cleaned.Replace("\n", "\\n")}");
+            Assert(cleaned.Contains("before vim") && cleaned.Contains("back to shell"),
+                $"alt-screen: surrounding output preserved — got {cleaned.Replace("\n", "\\n")}");
+        }
+
+        // Issue #4 reproducer (Git Bash via ConPTY): the cleaned slice
+        // contains banana, then a screen-redraw burst with cherry +
+        // elderberry, plus the cursor-positioning escape sequences
+        // ConPTY emits between them. Expect all three to land in the
+        // cleaned output, none of the cursor moves.
+        {
+            var raw = "\x1b[?25lbanana \r\n\x1b[?25h"
+                    + "\x1b[?25lcherry     \r\nelderberry \r\n\x1b[?25h"
+                    + "\x1b[?25l\x1b[H \x1b[7;1H\x1b[?25h";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned.Contains("banana") && cleaned.Contains("cherry") && cleaned.Contains("elderberry"),
+                $"issue#4: all three grep matches survive ConPTY redraw burst — got {cleaned.Replace("\n", "\\n")}");
+            Assert(!cleaned.Contains("\x1b["),
+                $"issue#4: no leftover CSI sequences in cleaned output — got {cleaned}");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
