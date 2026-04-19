@@ -160,6 +160,89 @@ public static class CommandOutputFinalizerTests
                 "cleanstring: body lines preserved");
         }
 
+        // ---- Progress-bar collapse semantics ----
+        // Visible terminal mirror keeps raw bytes; MCP-response output
+        // collapses progress redraws so AI sees the final frame, not
+        // every intermediate one.
+
+        // Bare CR overwrites the current line — dotnet build / pip
+        // download style "\r[10%]\r[20%]\r[30%]" spinner.
+        {
+            var raw = "Progress 10%\rProgress 20%\rProgress 30%\ndone\n";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "Progress 30%\ndone",
+                $"progress: bare CR collapses to last frame — got {cleaned}");
+        }
+
+        // CRLF stays a real newline (not a CR-overwrite).
+        {
+            var raw = "line1\r\nline2\r\nline3";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "line1\nline2\nline3",
+                $"crlf: \\r\\n stays a real newline — got {cleaned}");
+        }
+
+        // Single-row progress bar — \x1b[1A\x1b[K + redraw, repeated.
+        // Common dotnet-build / cargo / pip pattern.
+        {
+            var raw = "Building...\n0%\n\x1b[1A\x1b[K10%\n\x1b[1A\x1b[K50%\n\x1b[1A\x1b[K100%\n";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "Building...\n100%",
+                $"single-row progress: cursor-up + erase + redraw collapses to last frame — got {cleaned.Replace("\n", "\\n")}");
+        }
+
+        // Multi-row status block — msbuild-style: cursor-up N, then K
+        // + redraw on each affected row. Each row needs its own K
+        // (the shell repaints per-row); without K the prior content
+        // survives, matching real terminal semantics.
+        {
+            var raw = "Restore (1s)\nLink (5s)\n\x1b[2A\x1b[KRestore (4s)\n\x1b[KLink (10s)\n";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "Restore (4s)\nLink (10s)",
+                $"multi-row block: per-row erase + redraw collapses both frames — got {cleaned.Replace("\n", "\\n")}");
+        }
+
+        // Backspace spinner — single-char redraw "|/-\\" with \b.
+        {
+            var raw = "Working |\b/\b-\b\\\bdone\n";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "Working done",
+                $"backspace: spinner chars collapsed — got {cleaned}");
+        }
+
+        // SGR (color) survives the collapse.
+        {
+            var raw = "before\x1b[31mred\x1b[0m after";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "before\x1b[31mred\x1b[0m after",
+                $"sgr: color sequences kept verbatim — got {cleaned}");
+        }
+
+        // OSC dropped (window title from xterm/iTerm).
+        {
+            var raw = "real \x1b]0;window-title\x07output";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "real output",
+                $"osc: dropped — got {cleaned}");
+        }
+
+        // CSI cursor-up clamped at the start of the buffer (don't crash
+        // on more-up-than-lines).
+        {
+            var raw = "only one\n\x1b[10A\x1b[Knew\n";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "new",
+                $"cursor-up clamp: don't underflow — got {cleaned}");
+        }
+
+        // Mixed: bare CR inside an SGR-coloured progress run.
+        {
+            var raw = "\x1b[36mProgress 10%\r\x1b[36mProgress 99%\r\x1b[32mDone\x1b[0m\n";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "\x1b[32mDone\x1b[0m",
+                $"mixed sgr+cr: only final frame survives — got {cleaned}");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }

@@ -158,6 +158,18 @@ return the same `CommandResult` shape.
   `0700` and spill files `0600` via `UnixCreateMode` on .NET 9 —
   command output (which can contain secrets) is no longer world-
   readable on multi-user hosts.
+- **Progress-bar redraws no longer flood the MCP `output`.**
+  `CommandOutputFinalizer.StripAnsi` is rewritten as a grid-less
+  line + cursor-row tracker: bare `\r` overwrites the current line
+  in place (dotnet-build / pip-download style spinners), CSI
+  cursor-up (`A`) rewinds the row index, CSI erase-in-line (`K`)
+  / erase-in-display (`J`) clear the current row, `\b` undoes one
+  character. Previously these were stripped as raw bytes, so each
+  redraw landed as a fresh line and a `./Build.ps1` invocation
+  filled the AI-visible output with dozens of stale frames. SGR
+  (color) is still kept verbatim. The visible-terminal mirror is
+  untouched — the human still sees a live progress bar exactly as
+  the shell intended; only the AI-facing `output` collapses.
 
 ## [0.8.0] - 2026-04-16
 
