@@ -119,6 +119,19 @@ internal sealed class CommandOutputRenderer
     // know whether absolute cursor positioning can be trusted.
     private readonly int _baselineRowCount;
 
+    // Viewport top in our row space. At baseline init this is 0 (snapshot
+    // grid rows are at indices [0, _baselineRowCount)). Each time a LF
+    // would push the cursor past the viewport bottom, we increment
+    // _viewportTop to model how ConPTY's screen viewport slides as new
+    // content arrives. CUP/HVP/VPA target rows RELATIVE to the current
+    // viewport top — that's what makes ConPTY's post-alt-screen repaint
+    // (which addresses the CURRENT viewport, not the snapshot's
+    // viewport) write to the right cells. Without this, a printf that
+    // emits a couple of LFs before entering alt-screen would shift
+    // ConPTY's viewport without our knowledge, and the repaint would
+    // hit baseline rows that no longer hold the chars ConPTY expects.
+    private int _viewportTop;
+
     // Alt-screen state. While active, writes are applied to a
     // separate row list — but Render() ignores it; only the placeholder
     // appears in output. On exit we restore main-buffer cursor state
@@ -448,6 +461,15 @@ internal sealed class CommandOutputRenderer
         SetRow(newRow);
         EnsureRow(newRow);
         SetCol(0);
+
+        // Viewport scroll bookkeeping — only the main buffer; the alt
+        // buffer has its own cursor space and doesn't interact with the
+        // baseline snapshot.
+        if (!_altActive && _baselineRowCount > 0
+            && newRow >= _viewportTop + _baselineRowCount)
+        {
+            _viewportTop = newRow - _baselineRowCount + 1;
+        }
     }
 
     private void WriteChar(char c)
@@ -706,27 +728,31 @@ internal sealed class CommandOutputRenderer
             case 'H':
             case 'f':
                 {
-                    // With a snapshot baseline, CSI coords address
-                    // viewport rows directly — row 1 maps to snapshot
-                    // row 0. The per-cell repaint detector handles
-                    // ConPTY's idempotent re-emission of pre-command
-                    // content without flagging the row modified, so
-                    // those moves don't leak baseline content into the
-                    // output.
+                    // With a snapshot baseline, CSI coords address the
+                    // CURRENT viewport — which may have scrolled past
+                    // the baseline since OSC C as the command emitted
+                    // LFs. _viewportTop tracks the current scroll
+                    // offset, so row 1 of CSI coords maps to row
+                    // _viewportTop. The per-cell repaint detector then
+                    // sees ConPTY's repaint write the right baseline
+                    // cells with their existing values (idempotent →
+                    // no diff → not in output).
                     //
                     // Without a baseline (the legacy CleanString test
                     // path) the screen viewport is unknown; an absolute
                     // CSI H targeting a row before our current cursor
-                    // is almost always ConPTY redraw noise (Git Bash
-                    // emits \x1b[H + space + \x1b[N;1H around prompts)
-                    // that would corrupt earlier output. Clamp upward
-                    // to the current row in that case — the maximum
-                    // correctness given no viewport information.
+                    // is almost always ConPTY redraw noise that would
+                    // corrupt earlier output. Clamp upward to the
+                    // current row in that case.
                     int wantRow = Math.Max(0, GetParam(paramsSpan, 0, 1) - 1);
                     int newCol = Math.Clamp(GetParam(paramsSpan, 1, 1) - 1, 0, MaxCol);
-                    int newRow = (_baselineRowCount > 0 || _altActive)
-                        ? wantRow
-                        : Math.Max(CurRow, wantRow);
+                    int newRow;
+                    if (_altActive)
+                        newRow = wantRow;
+                    else if (_baselineRowCount > 0)
+                        newRow = _viewportTop + wantRow;
+                    else
+                        newRow = Math.Max(CurRow, wantRow);
                     EnsureRow(newRow);
                     SetCol(newCol);
                 }
@@ -734,9 +760,13 @@ internal sealed class CommandOutputRenderer
             case 'd':
                 {
                     int wantRow = Math.Max(0, GetParam(paramsSpan, 0, 1) - 1);
-                    int newRow = (_baselineRowCount > 0 || _altActive)
-                        ? wantRow
-                        : Math.Max(CurRow, wantRow);
+                    int newRow;
+                    if (_altActive)
+                        newRow = wantRow;
+                    else if (_baselineRowCount > 0)
+                        newRow = _viewportTop + wantRow;
+                    else
+                        newRow = Math.Max(CurRow, wantRow);
                     EnsureRow(newRow);
                 }
                 break;
