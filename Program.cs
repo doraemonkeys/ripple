@@ -80,6 +80,18 @@ public class Program
             return;
         }
 
+        // --spill-tests: run only the Windows-only spill integration
+        // suite without the surrounding --test / --e2e harness. Lets
+        // the spill path be exercised in isolation (faster feedback
+        // when iterating on OutputTruncationHelper / finalize-window
+        // changes) and keeps the fail-fast contract: any scenario
+        // failure exits the process with code 1.
+        if (args.Contains("--spill-tests"))
+        {
+            await Tests.SpillIntegrationTests.Run();
+            return;
+        }
+
         // --test mode: run tests
         if (args.Contains("--test"))
         {
@@ -94,14 +106,25 @@ public class Program
             Tests.PwshColorizerTests.Run();
             Tests.ConsoleManagerTests.Run();
             Tests.ConsoleWorkerTests.RunUnitTests();
+            Tests.ConsoleWorkerTests.RunCacheUnitTests();
             Tests.RegexPromptDetectorTests.Run();
             Tests.BalancedParensCounterTests.Run();
             Tests.ModeDetectorTests.Run();
+            Tests.OutputTruncationHelperTests.Run();
+            Tests.CommandOutputCaptureTests.Run();
+            Tests.CommandOutputFinalizerTests.Run();
             Tests.FileToolsTests.Run();
             Tests.AdapterLoaderTests.Run(registry, adapterReport);
             if (args.Contains("--e2e"))
             {
                 await Tests.ConsoleWorkerTests.Run();
+                // Run the issue #1 spill suite before the multi-shell
+                // block so it is always reachable — RunMultiShell's
+                // per-suite Environment.Exit on failure (currently hit
+                // by pre-existing bash subshell timeout / exit-code
+                // assertions on some boxes) would otherwise abort
+                // --e2e before the spill assertions get to execute.
+                await Tests.SpillIntegrationTests.Run();
                 await Tests.ConsoleWorkerTests.RunMultiShell();
                 await Tests.ConsoleWorkerTests.RunIntegrationScriptGuardTest();
                 var failed = await Tests.AdapterDeclaredTestsRunner.RunAsync(registry);
