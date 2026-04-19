@@ -2214,8 +2214,8 @@ public class ConsoleWorker
                         && _tracker.RunningCommand != null
                         && !_regexContinuationEscapeSent)
                     {
-                        var contOffsets = _regexContinuationDetector.Scan(result.Cleaned);
-                        if (contOffsets.Count > 0)
+                        var contMatches = _regexContinuationDetector.Scan(result.Cleaned);
+                        if (contMatches.Count > 0)
                         {
                             Log($"Continuation prompt detected during AI command; writing escape {EscapeForLog(_regexContinuationEscape)}");
                             _regexContinuationEscapeSent = true;
@@ -2244,21 +2244,28 @@ public class ConsoleWorker
                         // so the offsets come back in original-byte
                         // coordinates that line up with the same
                         // cleaned text we feed to the tracker below.
-                        var promptOffsets = _regexPromptDetector.Scan(result.Cleaned);
-                        if (promptOffsets.Count > 0)
+                        //
+                        // Use Start (the first visible char of the
+                        // prompt) for both synthetic events: that puts
+                        // the prompt cap RIGHT BEFORE the prompt, so
+                        // the regex-prompt REPLs (node, pdb, perldb,
+                        // python) don't leak the next prompt's chars
+                        // into the AI-facing output.
+                        var promptMatches = _regexPromptDetector.Scan(result.Cleaned);
+                        if (promptMatches.Count > 0)
                         {
                             var merged = new List<OscParser.OscEvent>(result.Events);
-                            foreach (var offset in promptOffsets)
+                            foreach (var match in promptMatches)
                             {
                                 if (_regexFirstPromptSeen)
                                 {
                                     merged.Add(new OscParser.OscEvent(
                                         OscParser.OscEventType.CommandFinished,
-                                        ExitCode: 0, TextOffset: offset));
+                                        ExitCode: 0, TextOffset: match.Start));
                                 }
                                 merged.Add(new OscParser.OscEvent(
                                     OscParser.OscEventType.PromptStart,
-                                    TextOffset: offset));
+                                    TextOffset: match.Start));
                                 _regexFirstPromptSeen = true;
                             }
                             merged.Sort((a, b) => a.TextOffset.CompareTo(b.TextOffset));

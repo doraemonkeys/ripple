@@ -24,35 +24,37 @@ public static class RegexPromptDetectorTests
         // Fresh chunk with a single prompt at start.
         {
             var d = new RegexPromptDetector(pythonPrompt);
-            var offsets = d.Scan(">>> ");
-            Assert(offsets.Count == 1 && offsets[0] == 4,
-                $"prompt at chunk start fires once at end-of-prompt (got {string.Join(",", offsets)})");
+            var matches = d.Scan(">>> ");
+            Assert(matches.Count == 1 && matches[0].Start == 0 && matches[0].End == 4,
+                $"prompt at chunk start: Start=0, End=4 (got {FormatMatches(matches)})");
         }
 
-        // Prompt after output.
+        // Prompt after output. Start should be RIGHT AFTER the leading \n
+        // — the visible-prompt boundary the worker uses for synthetic
+        // CommandFinished + PromptStart placement.
         {
             var d = new RegexPromptDetector(pythonPrompt);
             var chunk = "hello\n>>> ";
-            var offsets = d.Scan(chunk);
-            Assert(offsets.Count == 1 && offsets[0] == chunk.Length,
-                $"prompt after output fires at end-of-chunk (got {string.Join(",", offsets)})");
+            var matches = d.Scan(chunk);
+            Assert(matches.Count == 1 && matches[0].Start == 6 && matches[0].End == chunk.Length,
+                $"prompt after output: Start=6 (after \\n), End=chunk.Length (got {FormatMatches(matches)})");
         }
 
         // Two prompts in one chunk (rare but possible on fast commands).
         {
             var d = new RegexPromptDetector(pythonPrompt);
             var chunk = ">>> 1\n>>> ";
-            var offsets = d.Scan(chunk);
-            Assert(offsets.Count == 2,
-                $"two prompts in one chunk (got {offsets.Count})");
+            var matches = d.Scan(chunk);
+            Assert(matches.Count == 2,
+                $"two prompts in one chunk (got {matches.Count})");
         }
 
         // No prompt: nothing emitted.
         {
             var d = new RegexPromptDetector(pythonPrompt);
-            var offsets = d.Scan("just some output with no prompt\n");
-            Assert(offsets.Count == 0,
-                $"no prompt, no events (got {offsets.Count})");
+            var matches = d.Scan("just some output with no prompt\n");
+            Assert(matches.Count == 0,
+                $"no prompt, no events (got {matches.Count})");
         }
 
         // Prompt split across chunk boundary — the \n arrives in chunk 1,
@@ -89,9 +91,9 @@ public static class RegexPromptDetectorTests
         // Output containing ">>>" that isn't at line start must not match.
         {
             var d = new RegexPromptDetector(pythonPrompt);
-            var offsets = d.Scan("look: >>> that is mid-line");
-            Assert(offsets.Count == 0,
-                $"'>>>' mid-line does NOT match (got {offsets.Count})");
+            var matches = d.Scan("look: >>> that is mid-line");
+            Assert(matches.Count == 0,
+                $"'>>>' mid-line does NOT match (got {matches.Count})");
         }
 
         // irb-style prompt with a numeric counter — proves the detector
@@ -100,12 +102,12 @@ public static class RegexPromptDetectorTests
         {
             const string irbPrompt = @"(^|\n)irb\(main\):\d+:\d+> ";
             var d = new RegexPromptDetector(irbPrompt);
-            var offsets = d.Scan("irb(main):001:0> ");
-            Assert(offsets.Count == 1,
-                $"irb prompt regex fires on match (got {offsets.Count})");
-            var offsets2 = d.Scan("=> 2\nirb(main):002:0> ");
-            Assert(offsets2.Count == 1,
-                $"irb counter increments, still matches (got {offsets2.Count})");
+            var matches = d.Scan("irb(main):001:0> ");
+            Assert(matches.Count == 1,
+                $"irb prompt regex fires on match (got {matches.Count})");
+            var matches2 = d.Scan("=> 2\nirb(main):002:0> ");
+            Assert(matches2.Count == 1,
+                $"irb counter increments, still matches (got {matches2.Count})");
         }
 
         // --- CSI-aware scenarios (fsi-style ConPTY rendering) ---
@@ -119,16 +121,18 @@ public static class RegexPromptDetectorTests
         {
             var d = new RegexPromptDetector(@"^> $");
             var chunk = "\x1b[?25l\x1b[m it: int = 2\x1b[12;1H> \x1b[?25h";
-            var offsets = d.Scan(chunk);
-            Assert(offsets.Count == 1,
-                $"CSI: prompt with cursor positioning + show-cursor matches (got {offsets.Count})");
-            // The reported offset should land at the original-coordinate
-            // position right after the trailing \x1b[?25h (= chunk.Length),
-            // not at an internal byte position.
-            if (offsets.Count == 1)
+            var matches = d.Scan(chunk);
+            Assert(matches.Count == 1,
+                $"CSI: prompt with cursor positioning + show-cursor matches (got {matches.Count})");
+            // End should land at chunk.Length (past trailing \x1b[?25h).
+            // Start should land right after the cursor-positioning CSI
+            // that the strip path substituted for a synthesized newline.
+            if (matches.Count == 1)
             {
-                Assert(offsets[0] == chunk.Length,
-                    $"CSI: offset is past trailing CSI (got {offsets[0]}, expected {chunk.Length})");
+                Assert(matches[0].End == chunk.Length,
+                    $"CSI: End is past trailing CSI (got {matches[0].End}, expected {chunk.Length})");
+                Assert(matches[0].Start < matches[0].End,
+                    $"CSI: Start ({matches[0].Start}) precedes End ({matches[0].End})");
             }
         }
 
@@ -136,9 +140,9 @@ public static class RegexPromptDetectorTests
         {
             var d = new RegexPromptDetector(@"^> $");
             var chunk = "\x1b[?25l\x1b[m it: int = 2\x1b[12;1H\x1b[?25h";  // no `> `
-            var offsets = d.Scan(chunk);
-            Assert(offsets.Count == 0,
-                $"CSI: chunk without `> ` does NOT match (got {offsets.Count})");
+            var matches = d.Scan(chunk);
+            Assert(matches.Count == 0,
+                $"CSI: chunk without `> ` does NOT match (got {matches.Count})");
         }
 
         // Prompt arriving as a separate chunk after the CSI tail of the
@@ -260,5 +264,10 @@ public static class RegexPromptDetectorTests
 
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
+    }
+
+    private static string FormatMatches(System.Collections.Generic.List<RegexPromptDetector.PromptMatch> matches)
+    {
+        return "[" + string.Join(", ", matches.ConvertAll(m => $"({m.Start},{m.End})")) + "]";
     }
 }

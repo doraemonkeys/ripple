@@ -45,18 +45,30 @@ public sealed class RegexPromptDetector
     }
 
     /// <summary>
-    /// Scan a chunk of cleaned output for prompt matches. Returns the
-    /// list of chunk-local offsets (one per match) at which a virtual
-    /// PromptStart event should fire. Offsets are into the
-    /// <paramref name="chunk"/> passed in (in raw / original
-    /// coordinates, including any CSI escapes), so the caller can
-    /// merge them with OscParser events that already carry chunk-local
-    /// TextOffset values.
+    /// A prompt match — chunk-local Start (where the visible prompt
+    /// begins) and End (one past the last consumed byte) coordinates.
+    /// Both are in original/raw chunk coordinates including any CSI
+    /// escapes, so callers can merge with OscParser events that carry
+    /// chunk-local TextOffset values.
+    ///
+    /// Why both: synthetic OSC CommandFinished + PromptStart events
+    /// should fire at <see cref="Start"/> so the prompt itself is not
+    /// included in [commandStart, OSC A] window — without that, regex-
+    /// prompt REPLs (node, python, pdb, perldb, …) leak the next
+    /// prompt's chars into the AI-facing output. Continuation-prompt
+    /// detection only needs <see cref="End"/> (it just wants to know
+    /// "did we see the prompt yet?").
     /// </summary>
-    public List<int> Scan(string chunk)
+    public readonly record struct PromptMatch(int Start, int End);
+
+    /// <summary>
+    /// Scan a chunk of cleaned output for prompt matches. Returns one
+    /// <see cref="PromptMatch"/> per match in chunk-local coordinates.
+    /// </summary>
+    public List<PromptMatch> Scan(string chunk)
     {
-        var offsets = new List<int>();
-        if (chunk.Length == 0) return offsets;
+        var matches = new List<PromptMatch>();
+        if (chunk.Length == 0) return matches;
 
         var searchIn = _buffer + chunk;
         var bufferLen = _buffer.Length;
@@ -83,7 +95,24 @@ public sealed class RegexPromptDetector
             // the buffer boundary lives.
             if (originalEnd <= bufferLen) continue;
 
-            offsets.Add(originalEnd - bufferLen);
+            // Determine the start of the *visible* prompt. Patterns that
+            // anchor with (^|\n) match starting at the \n char itself
+            // — bump past it so the start position is the first visible
+            // char of the prompt, which is what callers want for
+            // synthetic OSC PromptStart placement (otherwise the
+            // preceding newline ends up before the prompt-cap and the
+            // last command-output line gets clipped).
+            int strippedStart = m.Index;
+            if (strippedStart < stripped.Length && stripped[strippedStart] == '\n')
+                strippedStart++;
+            var originalStart = map[strippedStart];
+
+            // Convert to chunk-local coordinates. If the match started
+            // inside the carry-over buffer, clamp to 0 — anything before
+            // the chunk has already been emitted.
+            int chunkStart = Math.Max(0, originalStart - bufferLen);
+            int chunkEnd = originalEnd - bufferLen;
+            matches.Add(new PromptMatch(chunkStart, chunkEnd));
             lastReportedOriginalEnd = originalEnd;
         }
 
@@ -108,7 +137,7 @@ public sealed class RegexPromptDetector
                 : tail[^MaxBufferLength..];
         }
 
-        return offsets;
+        return matches;
     }
 
     /// <summary>

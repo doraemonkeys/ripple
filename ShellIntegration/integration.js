@@ -6,17 +6,24 @@
 // so the launch convention is just `node integration.js`. This file calls
 // repl.start() to begin the interactive REPL and then customises it.
 //
-// OSC bytes are written out-of-band via process.stdout.write *after*
-// the original displayPrompt has positioned the cursor for input.
-// Putting them inside the prompt string (via setPrompt) miscomputes
-// the visible cursor on Windows: Node's readline strips OSC escapes
-// when computing prompt width, but ConPTY advances its tracked
-// cursor for every byte it doesn't recognise as a terminal command,
-// so readline-vs-ConPTY desync after the first prompt and every
-// keystroke lands at the wrong column. Writing the bytes AFTER orig
-// keeps the prompt string a clean "> " for readline's width math
-// and emits the OSC sequence as a zero-width side channel that
-// splash's OscParser captures cleanly.
+// OSC bytes are written out-of-band via process.stdout.write *before*
+// the original displayPrompt paints the visible "> ". Putting them
+// inside the prompt string (via setPrompt) miscomputes the visible
+// cursor on Windows: Node's readline strips OSC escapes when computing
+// prompt width, but ConPTY advances its tracked cursor for every byte
+// it doesn't recognise as a terminal command, so readline-vs-ConPTY
+// desync after the first prompt and every keystroke lands at the
+// wrong column. Writing the bytes out-of-band keeps the prompt string
+// a clean "> " for readline's width math and emits OSC as a zero-width
+// side channel.
+//
+// The "before" ordering matters for AI-facing output: ripple's
+// CommandOutputRenderer caps the command-output window at the OSC A
+// position, so OSC A firing AFTER the visible "> " would leak the
+// prompt char into every node command's response (the original cause
+// of the trailing "> " noise). Emitting OSC A first makes the cap
+// land RIGHT BEFORE the prompt — clean output. OSC sequences are
+// zero-width so writing them at any cursor position is safe.
 //
 // Multi-line command bodies arrive via splash's tempfile delivery as
 // `await _splash_exec_file("...")`. The helper is async + top-level
@@ -74,12 +81,13 @@ process.stdout.write(_splashOscPrefix());
 
 const _splashOriginalDisplayPrompt = server.displayPrompt.bind(server);
 server.displayPrompt = function (preserveCursor) {
-    const result = _splashOriginalDisplayPrompt(preserveCursor);
-    // Emit OSC bytes AFTER the original has rendered the prompt and
-    // positioned the cursor. Zero-width side channel — see the header
-    // comment for the rationale.
+    // Emit OSC bytes BEFORE the visible prompt so OSC A's position
+    // caps the command-output window RIGHT BEFORE the "> " — without
+    // this, the prompt char leaks into every command's MCP response.
+    // OSC is zero-width — the subsequent displayPrompt still positions
+    // the cursor correctly.
     process.stdout.write(_splashOscPrefix());
-    return result;
+    return _splashOriginalDisplayPrompt(preserveCursor);
 };
 
 // Multi-line command delivery. splash writes the body to a tempfile and
