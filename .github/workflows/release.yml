@@ -75,9 +75,77 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
-    name: Sign, publish, release
+  # Authenticode signing must run on Windows — AzureSignTool v7 has an
+  # explicit "only supported on Windows" guard, and jsign-on-Linux would
+  # require a separate tool and Azure KV integration path. Cheapest way
+  # out is a dedicated windows-latest job that signs the already-built
+  # win32-x64 artifact and re-uploads it under the same name (overwrite)
+  # so the publish job's download-all logic transparently picks up the
+  # signed version. Only the Windows binary is signed; Linux/macOS have
+  # no equivalent OS-level signature verification path, and npm
+  # provenance (from the publish job) covers supply-chain trust.
+  sign-windows:
+    name: Sign Windows binary
     needs: build
+    runs-on: windows-latest
+    environment: release   # required-reviewer gate + federated-cred subject match
+
+    steps:
+      - name: Download win32-x64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ripple-win32-x64
+          path: win32-x64
+
+      - name: Azure OIDC login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install AzureSignTool
+        run: dotnet tool install --global AzureSignTool
+
+      - name: Sign ripple.exe via Azure Key Vault
+        env:
+          AZURE_KV_URL: ${{ vars.KEY_VAULT_URL }}
+          AZURE_KV_CERT: ${{ vars.SIGNING_CERT_NAME }}
+          EXPECTED_THUMBPRINT: '74E5208228DFB12A067747D536BF497B6E98C73C'
+        shell: pwsh
+        run: |
+          $token = az account get-access-token --resource https://vault.azure.net --query accessToken -o tsv
+          if ([string]::IsNullOrEmpty($token)) { throw "Failed to acquire Key Vault access token" }
+          AzureSignTool sign `
+            --azure-key-vault-url $env:AZURE_KV_URL `
+            --azure-key-vault-certificate $env:AZURE_KV_CERT `
+            --azure-key-vault-accesstoken $token `
+            --file-digest sha256 `
+            --timestamp-rfc3161 'http://timestamp.digicert.com' `
+            --description 'ripple - declarative shell adapter framework' `
+            --description-url 'https://github.com/yotsuda/ripple' `
+            win32-x64/ripple.exe
+          # Sanity check that the signature embedded a cert matching the
+          # known thumbprint. Runner trust chain may report UnknownError
+          # (self-signed root), so compare by thumbprint, not Status.
+          $sig = Get-AuthenticodeSignature win32-x64/ripple.exe
+          if ($sig.SignerCertificate.Thumbprint -ne $env:EXPECTED_THUMBPRINT) {
+            throw "Thumbprint mismatch: got $($sig.SignerCertificate.Thumbprint), expected $env:EXPECTED_THUMBPRINT"
+          }
+          Write-Host "Signed OK (thumbprint: $($sig.SignerCertificate.Thumbprint))"
+
+      - name: Upload signed win32-x64 artifact (overwrites unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ripple-win32-x64
+          path: win32-x64/ripple.exe
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  publish:
+    name: Publish npm + GitHub release
+    needs: sign-windows
     runs-on: ubuntu-latest
     environment: release   # required-reviewer gate + NPM_TOKEN scope
 
@@ -86,11 +154,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Setup .NET 9
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '9.0.x'
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -117,6 +180,9 @@ jobs:
             [[ "$version" == "$pv" ]] || { echo "$plat subpackage version mismatch" >&2; exit 1; }
           done
 
+      # Downloads ripple-win32-x64 (now the SIGNED version, overwritten
+      # by the sign-windows job) alongside the unsigned linux-x64 and
+      # darwin-arm64 artifacts from the build job.
       - name: Download all platform binaries
         uses: actions/download-artifact@v4
         with:
@@ -134,49 +200,6 @@ jobs:
           # Remove placeholder .gitkeep files so they don't ship in the tarball.
           rm -f npm/platforms/*/bin/.gitkeep
           ls -la npm/platforms/*/bin/
-
-      - name: Azure OIDC login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Install AzureSignTool
-        # dotnet tool install --global lands the binary in $HOME/.dotnet/tools
-        # but, on Linux runners, that directory is NOT on $PATH by default
-        # (Windows runners add it automatically). Export it via $GITHUB_PATH
-        # so the next step's `AzureSignTool` invocation resolves.
-        run: |
-          dotnet tool install --global AzureSignTool
-          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
-
-      # AzureSignTool is a cross-platform .NET tool; Authenticode
-      # signing works from Linux as long as we have the Key Vault
-      # access token. The invocation is `azuresigntool` (lowercase) —
-      # v7+ installs the binary under that name, and Linux's
-      # case-sensitive filesystem won't resolve `AzureSignTool`.
-      # Windows runners happen to be case-insensitive but the
-      # lowercase form is portable.
-      - name: Sign Windows binary via Azure Key Vault
-        env:
-          AZURE_KV_URL: ${{ vars.KEY_VAULT_URL }}
-          AZURE_KV_CERT: ${{ vars.SIGNING_CERT_NAME }}
-          EXPECTED_THUMBPRINT: '74E5208228DFB12A067747D536BF497B6E98C73C'
-        shell: bash
-        run: |
-          set -euo pipefail
-          token=$(az account get-access-token --resource https://vault.azure.net --query accessToken -o tsv)
-          [[ -n "$token" ]] || { echo "Failed to acquire Key Vault access token" >&2; exit 1; }
-          azuresigntool sign \
-            --azure-key-vault-url "$AZURE_KV_URL" \
-            --azure-key-vault-certificate "$AZURE_KV_CERT" \
-            --azure-key-vault-accesstoken "$token" \
-            --file-digest sha256 \
-            --timestamp-rfc3161 'http://timestamp.digicert.com' \
-            --description 'ripple - declarative shell adapter framework' \
-            --description-url 'https://github.com/yotsuda/ripple' \
-            npm/platforms/win32-x64/bin/ripple.exe
 
       # Publish subpackages BEFORE meta. Meta's optionalDependencies
       # reference these exact versions; if meta published first and a
