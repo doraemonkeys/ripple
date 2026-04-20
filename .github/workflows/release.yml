@@ -42,10 +42,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup .NET 9
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '9.0.x'
 
@@ -68,7 +68,7 @@ jobs:
           "./dist/${{ matrix.exe }}" --test
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ripple-${{ matrix.platform }}
           path: dist/${{ matrix.exe }}
@@ -92,7 +92,7 @@ jobs:
 
     steps:
       - name: Download win32-x64 artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: ripple-win32-x64
           path: win32-x64
@@ -135,7 +135,7 @@ jobs:
           Write-Host "Signed OK (thumbprint: $($sig.SignerCertificate.Thumbprint))"
 
       - name: Upload signed win32-x64 artifact (overwrites unsigned)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ripple-win32-x64
           path: win32-x64/ripple.exe
@@ -151,12 +151,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
@@ -184,7 +184,7 @@ jobs:
       # by the sign-windows job) alongside the unsigned linux-x64 and
       # darwin-arm64 artifacts from the build job.
       - name: Download all platform binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 

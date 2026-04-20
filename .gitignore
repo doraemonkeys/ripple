@@ -5,3 +5,4 @@ dist/
 *.user
 test-cmd.md
 scratch/
+*.tgz
