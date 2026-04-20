@@ -1,0 +1,18 @@
+{
+  "name": "@ytsuda/ripple-win32-x64",
+  "version": "0.11.0",
+  "description": "Windows x64 binary for @ytsuda/ripple.",
+  "license": "MIT",
+  "author": "Yoshifumi Tsuda",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yotsuda/ripple.git"
+  },
+  "homepage": "https://github.com/yotsuda/ripple",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": [
+    "bin/ripple.exe",
+    "README.md"
+  ]
+}

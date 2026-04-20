@@ -2,6 +2,26 @@
 
 All notable changes to ripple are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.11.0] - 2026-04-20
+
+Native binaries for Linux and macOS Apple Silicon ship alongside Windows, distributed as platform-specific npm subpackages. `npm i -g @ytsuda/ripple` now installs from `@ytsuda/ripple-win32-x64`, `@ytsuda/ripple-linux-x64`, or `@ytsuda/ripple-darwin-arm64` automatically via `optionalDependencies`; a small Node launcher (`bin/cli.mjs`) resolves the matching subpackage and spawns its binary with stdio inherited and SIGTERM/SIGINT/SIGHUP/SIGQUIT forwarded. The release workflow is a three-runner matrix build (windows-latest, ubuntu-latest, macos-latest) followed by a single Linux publish job that Authenticode-signs the Windows binary via AzureSignTool, publishes three subpackages + one meta-package with SLSA provenance, and attaches all three binaries to the GitHub Release.
+
+### Added
+
+- **Linux x64 and macOS arm64 native binaries.** NativeAOT-compiled from the same source as the Windows binary via the `build` matrix job; identical `--test` suite gates publish. macOS is Apple Silicon only — GHA's macos-13 (Intel) runner pool capacity made `osx-x64` unshippable.
+- **`@ytsuda/ripple-<platform>` subpackages.** Each carries `os` + `cpu` filters so npm installs only the matching one; the meta package's `optionalDependencies` skip the rest silently.
+- **`npm/bin/cli.mjs` dispatcher.** Resolves `<platform>-<arch>` against an allow-list, `require.resolve`s the subpackage binary, spawns it with `stdio: 'inherit'`, forwards SIGTERM/SIGINT/SIGHUP/SIGQUIT to the child, and re-raises the child's exit signal so `$?` / `%ERRORLEVEL%` / `$status` match a direct invocation.
+
+### Changed
+
+- **`.github/workflows/release.yml` is now a two-job matrix build + single-runner publish.** `build` uses `strategy.matrix` over `{win-x64, linux-x64, osx-arm64}` and uploads artifacts; `publish` (Linux, `environment: release`) downloads all three, signs the Windows binary, and publishes subpackages sequentially (win32-x64 → linux-x64 → darwin-arm64) before the meta package so a mid-sequence failure halts before the meta points at a missing subpackage.
+- **`npm/package.json` is now a meta-package.** Ships only `bin/cli.mjs`, README, LICENSE; `optionalDependencies` pin the three subpackages to the exact current version. The `os` restriction on the meta package has been removed — Node can install everywhere, the native binary enforcement is the subpackage filter.
+- **Version cross-check verifies five fields.** csproj `<Version>`, meta `npm/package.json`, and each of the three `npm/platforms/*/package.json` must all equal the pushed tag; the publish job aborts fast if any disagree.
+
+### Infrastructure
+
+Private runbook documenting the multi-platform release flow (subpackage layout, cross-platform AzureSignTool on Linux, rollback plan if Microsoft drops Linux support) lives at `C:\MyProj\vault\scratch\release-runbook.md`.
+
 ## [0.10.0] - 2026-04-20
 
 Three parallel rounds land in the same release. **(1) Live virtual-terminal cursor tracking** — ripple now keeps an authoritative VT-100 interpreter advanced from every PTY chunk and answers DSR (`\x1b[6n`) cursor-position queries from real state instead of the static "near the bottom of the screen" + prompt-heuristic column it shipped with. Closes the long-standing Unix drift where PSReadLine's up-arrow history recall painted over the active prompt, and bash readline wrapped long input lines into the wrong column, after a few AI commands' worth of output had scrolled past. **(2) Oversized command output is spilled to a temp file** (closes #1, PR #5) — outputs over `15,000` chars are written to a worker-owned spill file (`%TEMP%\ripple.output\` on Windows, `${TMPDIR:-/tmp}/ripple.output/` on Unix) and the MCP response returns a head + tail preview embedding the spill path. Inline `execute_command` and deferred `wait_for_completion` now flow through a shared finalize-once boundary so both delivery modes return the same `CommandResult` shape. **(3) Command-output extraction is rebuilt as a per-command fork of the live VT interpreter** (closes #4) — at OSC C the worker snapshots the session-wide `_vtState` and hands the snapshot to a new `CommandOutputRenderer` initialised from it. ConPTY's post-alt-screen and post-prompt redraw bursts target cells whose baseline values match what's being rewritten, so a per-cell change detector recognises them as idempotent overwrites and they stay out of the AI-facing MCP response. Alt-screen entry/exit collapses to an `[interactive screen session]` placeholder; soft-wrapped logical lines are re-joined at render time so a narrow PTY can't fragment a single `git log --oneline` entry.
