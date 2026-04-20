@@ -143,7 +143,13 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Install AzureSignTool
-        run: dotnet tool install --global AzureSignTool
+        # dotnet tool install --global lands the binary in $HOME/.dotnet/tools
+        # but, on Linux runners, that directory is NOT on $PATH by default
+        # (Windows runners add it automatically). Export it via $GITHUB_PATH
+        # so the next step's `AzureSignTool` invocation resolves.
+        run: |
+          dotnet tool install --global AzureSignTool
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
 
       # AzureSignTool is a cross-platform .NET tool; Authenticode
       # signing works from Linux as long as we have the Key Vault
